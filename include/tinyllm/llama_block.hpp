@@ -13,6 +13,7 @@
 #pragma once
 
 #include "tinyllm/attention.hpp"
+#include "tinyllm/kv_cache.hpp"
 #include "tinyllm/mlp.hpp"
 #include "tinyllm/rmsnorm.hpp"
 #include "tinyllm/tensor.hpp"
@@ -34,5 +35,13 @@ Tensor llama_block_forward(const Tensor& x,
                            const LlamaBlockWeights& w,
                            const AttentionConfig& cfg,
                            int64_t start_pos = 0);
+
+// Cached variant: appends the new K/V rows to `cache` and runs attention
+// against the full cached K/V.
+Tensor llama_block_forward_cached(const Tensor& x,
+                                  const LlamaBlockWeights& w,
+                                  const AttentionConfig& cfg,
+                                  KvCache& cache,
+                                  int64_t start_pos = 0);
 
 }  // namespace tinyllm

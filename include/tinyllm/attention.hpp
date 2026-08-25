@@ -16,12 +16,20 @@
 //   ctx = weights @ V                shape [seq_q, n_heads * head_dim]
 //   out = ctx @ Wo                   shape [seq_q, hidden]
 //
+// Two entry points:
+//   - attention_forward(...): pure (no cache). Used at prefill time and in
+//     tests where the caller doesn't want cache plumbing.
+//   - attention_forward_cached(..., cache, start_pos): appends the new
+//     K/V rows to `cache` and scores against the entire cached K/V. In
+//     the decode path, seq_q=1 and seq_k = cache.length_ after append.
+//
 // Phase 5 does the simple version: no KV cache, full causal mask, no
-// batched heads (one matmul per head). Phase 6 will add the cache.
-// Phase 9 will fold Q @ Kᵀ across heads into one big matmul.
+// batched heads (one matmul per head). Phase 9 will fold Q @ Kᵀ across
+// heads into one big matmul.
 // -----------------------------------------------------------------------------
 #pragma once
 
+#include "tinyllm/kv_cache.hpp"
 #include "tinyllm/tensor.hpp"
 
 #include <cstdint>
@@ -49,5 +57,17 @@ Tensor attention_forward(const Tensor& x,
                          const AttentionWeights& w,
                          const AttentionConfig& cfg,
                          int64_t start_pos = 0);
+
+// Cached forward pass. `x` is shape [seq, hidden] (seq is usually 1 for
+// decode, > 1 for prefill). `start_pos` is the absolute position of the
+// first row of `x`. The function appends K and V rows to `cache` at
+// positions [start_pos, start_pos + seq), then computes attention with
+// K_total = cache.K[0 : start_pos + seq] (same for V). Causal mask is
+// absolute: k_pos > q_pos → -inf. Returns the [seq, hidden] output.
+Tensor attention_forward_cached(const Tensor& x,
+                                const AttentionWeights& w,
+                                const AttentionConfig& cfg,
+                                KvCache& cache,
+                                int64_t start_pos = 0);
 
 }  // namespace tinyllm
