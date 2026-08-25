@@ -50,6 +50,7 @@ add_library(tinyllm_core
     src/memory.cpp
     src/matmul.cpp
     src/tokenizer.cpp
+    src/gguf.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

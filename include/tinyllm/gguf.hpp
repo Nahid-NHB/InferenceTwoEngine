@@ -45,6 +45,9 @@
 #include <variant>
 #include <vector>
 
+// Forward decl (full def in gguf.cpp).
+struct GgufReader;
+
 namespace tinyllm {
 
 enum class GgufValueType : uint32_t {
@@ -94,11 +97,21 @@ public:
     template <typename T>
     GgufValue(T v) : s_(std::move(v)) {}
 
+    // Build from type + storage directly. Public so the parser in gguf.cpp
+    // doesn't need friend declarations.
+    static GgufValue make(GgufValueType t, Storage s) {
+        GgufValue v;
+        v.type_ = t;
+        v.s_    = std::move(s);
+        return v;
+    }
+
     GgufValueType type() const noexcept { return type_; }
     const Storage& storage() const noexcept { return s_; }
 
 private:
     friend class GgufFile;
+
     GgufValueType type_ = GgufValueType::Uint8;
     Storage s_;
 };
@@ -147,6 +160,10 @@ struct GgufTensorInfo {
 // -----------------------------------------------------------------------------
 // GGUF file
 // -----------------------------------------------------------------------------
+
+// Forward declaration of the parser-side helper; full def in gguf.cpp.
+struct GgufReader;
+
 class GgufFile {
 public:
     GgufFile() = default;
@@ -188,6 +205,17 @@ private:
     uint64_t data_section_offset_ = 0;
     uint64_t alignment_           = 32;
     uint32_t version_             = 3;
+};
+
+// Full definition of the byte reader (used in gguf.cpp).
+struct GgufReader {
+    const char* p;
+    const char* end;
+
+    GgufReader(const char* pp, const char* pe) : p(pp), end(pe) {}
+    void need(std::size_t n, const char* what) const;
+    template <typename T> T read_le(const char* what);
+    std::string read_str(const char* what);
 };
 
 }  // namespace tinyllm
