@@ -10,6 +10,7 @@
 // how to compose the tensor primitives.
 // -----------------------------------------------------------------------------
 #include "tinyllm/tensor.hpp"
+#include "tinyllm/matmul.hpp"
 
 #include <cstdio>
 #include <random>

@@ -165,8 +165,8 @@ Tensor mean   (const Tensor& a, std::optional<int64_t> axis = std::nullopt,
 // In-place softmax along an axis (numerically stable).
 Tensor softmax(const Tensor& a, int64_t axis = -1);
 
-// Matrix multiply: 2-D x 2-D → 2-D. Higher-rank is out of scope for Phase 1.
-Tensor matmul(const Tensor& a, const Tensor& b);
+// Matrix multiply: 2-D x 2-D → 2-D. Defined in matmul.hpp (Phase 2).
+//   #include "tinyllm/matmul.hpp" to use it.
 
 // Reshape helpers (also exposed as Tensor methods).
 Tensor reshape (const Tensor& a, std::vector<int64_t> shape);

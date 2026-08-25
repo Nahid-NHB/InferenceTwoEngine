@@ -7,3 +7,4 @@ function(tinyllm_add_bench name)
 endfunction()
 
 tinyllm_add_bench(bench_tensor bench_tensor.cpp)
+tinyllm_add_bench(bench_matmul bench_matmul.cpp)

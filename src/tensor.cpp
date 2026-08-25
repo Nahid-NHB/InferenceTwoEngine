@@ -9,6 +9,7 @@
 //     SIMD + threading, but never without a correctness benchmark first.
 // -----------------------------------------------------------------------------
 #include "tinyllm/tensor.hpp"
+#include "tinyllm/matmul.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -584,39 +585,14 @@ Tensor softmax(const Tensor& a, int64_t axis) {
 }
 
 // -----------------------------------------------------------------------------
-// matmul (2-D x 2-D, naive O(n^3))
-// We optimize this in Phase 2 with cache blocking / SIMD / threads.
+// matmul — Phase 2: dispatched in matmul.cpp.
+//
+// The default `ops::matmul(a, b)` picks the best variant for this CPU. To
+// benchmark or A/B-test specific implementations, use the explicit entry
+// points: `matmul_naive`, `matmul_blocked`, `matmul_avx2`, `matmul_threaded`.
+// (Implementation lives in matmul.cpp; this file only re-exports through the
+//  namespace alias `ops::matmul`.)
 // -----------------------------------------------------------------------------
-Tensor matmul(const Tensor& a, const Tensor& b) {
-    if (a.dtype() != DType::Float32 || b.dtype() != DType::Float32) {
-        throw std::invalid_argument("matmul: only float32 supported in Phase 1");
-    }
-    if (a.shape().size() != 2 || b.shape().size() != 2) {
-        throw std::invalid_argument("matmul: inputs must be 2-D in Phase 1");
-    }
-    if (a.shape()[1] != b.shape()[0]) {
-        throw std::invalid_argument("matmul: shape mismatch");
-    }
-    int64_t M = a.shape()[0];
-    int64_t K = a.shape()[1];
-    int64_t N = b.shape()[1];
-    Tensor ac = a.is_contiguous() ? a : a.contiguous();
-    Tensor bc = b.is_contiguous() ? b : b.contiguous();
-    Tensor out({M, N}, DType::Float32);
-    const float* A = ac.data_float();
-    const float* B = bc.data_float();
-    float*       C = out.data_float();
-    for (int64_t i = 0; i < M; ++i) {
-        for (int64_t j = 0; j < N; ++j) {
-            float s = 0.0f;
-            for (int64_t k = 0; k < K; ++k) {
-                s += A[i * K + k] * B[k * N + j];
-            }
-            C[i * N + j] = s;
-        }
-    }
-    return out;
-}
 
 // -----------------------------------------------------------------------------
 // reshape / transpose passthroughs

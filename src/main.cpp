@@ -6,6 +6,7 @@
 // model loading — that arrives in Phase 4.
 // -----------------------------------------------------------------------------
 #include "tinyllm/tensor.hpp"
+#include "tinyllm/matmul.hpp"
 
 #include <iostream>
 

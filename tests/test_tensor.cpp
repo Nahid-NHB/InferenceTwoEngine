@@ -4,6 +4,7 @@
 // -----------------------------------------------------------------------------
 #include "test_helpers.hpp"
 #include "tinyllm/tensor.hpp"
+#include "tinyllm/matmul.hpp"
 
 #include <cmath>
 #include <numeric>

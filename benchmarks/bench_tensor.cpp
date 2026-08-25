@@ -4,6 +4,7 @@
 // Runs naive matmul at a few sizes, prints GFLOPS and wall time.
 // -----------------------------------------------------------------------------
 #include "tinyllm/tensor.hpp"
+#include "tinyllm/matmul.hpp"
 
 #include <chrono>
 #include <cstdio>

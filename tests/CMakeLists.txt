@@ -4,6 +4,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/test_helpers.cmake)
 # pulls them all in via a single executable.
 add_library(tinyllm_test_cases OBJECT
     test_tensor.cpp
+    test_matmul.cpp
 )
 target_include_directories(tinyllm_test_cases PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

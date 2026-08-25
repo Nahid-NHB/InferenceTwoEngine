@@ -48,11 +48,23 @@ endfunction()
 add_library(tinyllm_core
     src/tensor.cpp
     src/memory.cpp
+    src/matmul.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 tinyllm_set_options(tinyllm_core)
+
+# Enable AVX2 + FMA on x86 if the compiler supports it.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i.86)")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2 -mfma -mbmi2" HAVE_AVX2_FLAG)
+    if(HAVE_AVX2_FLAG)
+        message(STATUS "Enabling AVX2 + FMA in tinyllm_core")
+        target_compile_options(tinyllm_core PRIVATE -mavx2 -mfma -mbmi2)
+        target_compile_definitions(tinyllm_core PRIVATE TINYLLM_ENABLE_AVX2=1)
+    endif()
+endif()
 
 # -----------------------------------------------------------------------------
 # Executables
