@@ -119,4 +119,56 @@ void matmul_q4_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
 void matmul_q8_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y);
 
+// -----------------------------------------------------------------------------
+// K-quants (Q4_K, Q5_K, Q6_K).
+//
+// These are the formats that ship in essentially every real-world Llama-
+// family GGUF (TinyLlama-1.1B-Q4_K_M, Llama-2-7B-Q4_K_M, Qwen2-* etc.).
+// Layout follows llama.cpp / ggml:
+//
+//   - Super-block size: QK_K = 256 elements (8 sub-blocks of 32).
+//   - For Q4_K / Q5_K the super-block carries:
+//       d    : f16 (super-block scale for the sub-block scales)
+//       dmin : f16 (super-block scale for the sub-block mins)
+//       scales[K_SCALE_SIZE = 12] : packed 6-bit scale+min, one byte per
+//                                   sub-block (with a clever nibble-share
+//                                   scheme — see get_scale_min_k4 below).
+//   - For Q6_K the layout is different: 16 sub-blocks of 16 elements,
+//     each sub-block carries its own int8 scale; only one super-block
+//     scale `d` is stored.
+//
+// On-disk byte sizes per super-block:
+//   Q4_K : 2 + 2 + 12 + 128                 = 144 bytes
+//   Q5_K : 2 + 2 + 12 + 128 (qs) + 32 (qh)  = 176 bytes
+//   Q6_K : 2 (d) + 16 (scales) + 128 (ql) + 64 (qh) = 210 bytes
+//
+// We only implement dequantize (read path). The format's quantize
+// implementation uses iterative K-means-style search that the llama.cpp
+// codebase has refined over years; we don't try to match it. Most users
+// will read pre-quantized GGUFs, not produce them.
+// -----------------------------------------------------------------------------
+constexpr int64_t kQK_K       = 256;   // super-block size
+constexpr int64_t kKScaleSize = 12;    // K_SCALE_SIZE: bytes of scale+min data
+constexpr std::size_t kQ4_KBlockBytes =
+    2 /*d*/ + 2 /*dmin*/ + kKScaleSize + kQK_K / 2;     // 144
+constexpr std::size_t kQ5_KBlockBytes =
+    2 /*d*/ + 2 /*dmin*/ + kKScaleSize + kQK_K / 2     // qs: 128
+                       + kQK_K / 8;                      // qh:  32   = 176
+constexpr std::size_t kQ6_KBlockBytes =
+    2 /*d*/ + kQK_K / 16 /*scales int8*/ + kQK_K / 2 /*ql*/
+                       + kQK_K / 4 /*qh*/;               // = 210
+
+void dequantize_q4_K(const uint8_t* packed, int64_t n, float* dst);
+void dequantize_q5_K(const uint8_t* packed, int64_t n, float* dst);
+void dequantize_q6_K(const uint8_t* packed, int64_t n, float* dst);
+
+// Reference matmul on K-quant weights (dequantize then FMA). We expose
+// this for completeness; the F32 loader just calls dequantize, so these
+// aren't on the hot path. They'll be useful once we add fused K-quant
+// matvec kernels (Phase 12 follow-up).
+void matmul_q4_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+void matmul_q6_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+
 }  // namespace tinyllm

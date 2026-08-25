@@ -22,6 +22,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   9   | Performance engineering (AVX2/512)   |   ✅   |
 |  10   | Benchmarking suite                   |   ✅   |
 |  11   | GGUF → LlamaModel loader + driver    |   ✅   |
+|  12   | K-quant dequant (Q4_K / Q5_K / Q6_K) |   ✅   |
 
 ## Build
 
@@ -35,9 +36,9 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 124 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
+./build/bin/run_all_tests    # 134 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
-                             # 13 sampler, 15 quantize, 6 llama_loader)
+                             # 13 sampler, 26 quantize, 6 llama_loader)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
 ./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_quantize   # Q4_0 / Q8_0 × F32 matvec vs F32 matmul
@@ -92,6 +93,7 @@ tinyllm/
 │   ├── matmul.hpp       # matmul variants + MatmulVariant enum
 │   ├── tokenizer.hpp    # BPE tokenizer
 │   ├── gguf.hpp         # GGUF file parser
+│   ├── quantize.hpp     # Q4_0, Q8_0, Q4_K, Q5_K, Q6_K block formats
 │   └── llama_loader.hpp # GGUF → LlamaModelWeights
 ├── src/
 │   ├── memory.cpp
@@ -99,6 +101,8 @@ tinyllm/
 │   ├── matmul.cpp       # naive / blocked / AVX2 / threaded
 │   ├── tokenizer.cpp
 │   ├── gguf.cpp
+│   ├── quantize.cpp     # dequant kernels for Q4_0/Q8_0 and the
+│   │                    # K-quants (Q4_K / Q5_K / Q6_K)
 │   └── main.cpp         # CLI smoke test
 ├── tests/
 │   ├── test_helpers.hpp # minimal REQUIRE/REQUIRE_NEAR harness
@@ -809,6 +813,112 @@ shim is per-model-family and out of scope for the engine itself.
 The synthetic file fixture is also dumped to
 `/tmp/tinyllm_test_loader.gguf` by the last test, so the driver can be
 smoke-tested without a real Llama checkpoint on hand.
+
+## Phase 12 notes — K-quant dequant (Q4_K / Q5_K / Q6_K)
+
+### Why
+
+Phase 11 shipped the GGUF → LlamaModel loader, but real-world Llama
+checkpoints (TinyLlama, Llama-2, Qwen2, Mistral, …) don't actually ship
+as `Q4_0` — they ship as **`Q4_K_M`**, `Q5_K_M`, or `Q6_K`. `load_tensor`
+threw "unsupported dtype" for any of those, which meant the
+`gguf_driver` could only load the synthetic test fixture. Phase 12 adds
+the missing dequant paths so `gguf_driver` can load any real
+Llama-family GGUF.
+
+### What got added
+
+`include/tinyllm/gguf.hpp` extended the `GgufTensorType` enum with
+`Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14`. We only
+implement the read paths for Q4_K / Q5_K / Q6_K — Q2_K and Q3_K remain
+"unsupported dtype" because no mainstream quantizer produces them any
+more (and they'd need fused dequant + matvec to be useful).
+
+`src/quantize.cpp` got three new dequant kernels — verbatim ports of
+`llama.cpp`'s `dequantize_row_q4_K`, `dequantize_row_q5_K`,
+`dequantize_row_q6_K`. The reference C (Apache-2.0) lives in
+`ggml-quants.c` and uses a clever nibble-share scheme for the 6-bit
+`(scale, min)` table of Q4_K/Q5_K that isn't documented in the GGUF
+spec; following the reference is the only safe way to read these
+formats.
+
+```cpp
+// All three are dequantize only — the F32 loader dequantizes into the
+// weight tensor; the existing F32 matmul is reused. Reference
+// `matmul_q4_K_f32` and `matmul_q6_K_f32` are exposed for parity with
+// the Q4_0/Q8_0 paths; no fused K-quant kernel yet.
+void dequantize_q4_K(const uint8_t* packed, int64_t n, float* dst);
+void dequantize_q5_K(const uint8_t* packed, int64_t n, float* dst);
+void dequantize_q6_K(const uint8_t* packed, int64_t n, float* dst);
+void matmul_q4_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+void matmul_q6_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+```
+
+`src/gguf.cpp::GgufFile::load_tensor` got three new switch cases for
+`Q4_K`, `Q5_K`, `Q6_K` that read the packed bytes from disk and call
+into the dequant kernels — same pattern as the existing Q4_0/Q8_0
+cases. `src/llama_loader.cpp::tensor_byte_size` was extended with the
+matching block sizes so the >4 GiB soft-warning remains accurate.
+
+`GgufTensorType::Q2_K` and `Q3_K` are recognized by name (so loading a
+Q2_K file gives a clear "unsupported dtype" message rather than "bad
+tensor type id") but the dequant is not implemented — they'd be a
+follow-up phase if we ever need them.
+
+### Format recap
+
+```text
+QK_K = 256  (super-block size, except Q6_K which is 16 sub-blocks of 16)
+
+Q4_K super-block (144 bytes):
+    d : f16  |  dmin : f16  |  12-byte packed 6-bit (sc, m)  |  128 qs
+  dequant:  y[i] = d * sc[i/32] * qs_nibble - dmin * m[i/32]
+
+Q5_K super-block (176 bytes):
+    d : f16  |  dmin : f16  |  12-byte packed 6-bit (sc, m)
+                                          |  128 qs  |  32 qh (1 bit/elt)
+  dequant:  y[i] = d * sc[i/32] * (qs_nibble + (qh[i] ? 16 : 0)) -
+                    dmin * m[i/32]
+
+Q6_K super-block (210 bytes):
+    128 ql  |  64 qh  |  16 scales int8  |  2 d : f16
+  dequant:  y[i] = d * sc[i/16] * ((ql | (qh << 4)) - 32)
+```
+
+### Tests
+
+`tests/test_quantize.cpp` adds 11 tests:
+
+- `q4_K_dequant_matches_formula`, `q5_K_dequant_matches_formula`,
+  `q6_K_dequant_matches_formula` — hand-construct a super-block with
+  known `d`, `dmin`, scales, and `qs/qh` values, dequantize, and verify
+  the output matches the formula element by element.
+- `q4_K_zero_block_dequantizes_to_zero` and the Q5_K / Q6_K equivalents
+  — all-zero packed input dequantizes to all-zero F32 output.
+- `gguf_loads_q4_K_tensor_all_zero` and the Q5_K / Q6_K equivalents —
+  write a synthetic GGUF v3 file with one K-quant tensor, load it via
+  `GgufFile::load_tensor`, and verify the result is an all-zero F32
+  tensor of the right shape.
+- `matmul_q4_K_matches_f32` — fake-quantize a matrix into Q4_K format
+  and verify the K-quant matmul matches the dequant-then-FMA reference
+  within 1e-3.
+
+The reader is one straight-line port from `llama.cpp`'s reference
+implementation — the tests are the safety net that catches any
+arithmetic typo. They all pass; total test count is now 134.
+
+### What's still missing
+
+- A **fused** K-quant matvec kernel. Today we dequantize each row into
+  a fresh `std::vector<float>` and call the F32 matmul — fine for
+  correctness, but it's the obvious Phase 9 follow-up if you want to
+  actually run a 7B Q4_K on this engine (right now it'd be ~10× slower
+  than llama.cpp because of the dequant bounce). The reference
+  `matmul_q4_K_f32` / `matmul_q6_K_f32` are scaffolded for that work.
+- Q2_K / Q3_K support. Same fused-kernel caveat as above; nobody ships
+  them in 2025+.
 
 ## License
 

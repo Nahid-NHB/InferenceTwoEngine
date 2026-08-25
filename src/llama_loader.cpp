@@ -50,8 +50,9 @@ namespace {
 
 // Compute the on-disk byte size for a single tensor (numel elements of
 // the given GGUF dtype). F32/F16 use the per-element size; Q4_0/Q8_0 use
-// the block-quantized sizes. Anything else returns 0 (treated as
-// unsupported by load_tensor).
+// the block-quantized sizes; Q4_K/Q5_K/Q6_K use the super-block layout
+// (QK_K = 256). Anything else returns 0 (treated as unsupported by
+// load_tensor).
 std::size_t tensor_byte_size(int64_t numel, GgufTensorType dt) {
     switch (dt) {
         case GgufTensorType::F32: return static_cast<std::size_t>(numel) * 4;
@@ -62,6 +63,15 @@ std::size_t tensor_byte_size(int64_t numel, GgufTensorType dt) {
         case GgufTensorType::Q8_0:
             if (numel % kQ8_0BlockSize != 0) return 0;
             return static_cast<std::size_t>(numel / kQ8_0BlockSize) * kQ8_0BlockBytes;
+        case GgufTensorType::Q4_K:
+            if (numel % kQK_K != 0) return 0;
+            return static_cast<std::size_t>(numel / kQK_K) * kQ4_KBlockBytes;
+        case GgufTensorType::Q5_K:
+            if (numel % kQK_K != 0) return 0;
+            return static_cast<std::size_t>(numel / kQK_K) * kQ5_KBlockBytes;
+        case GgufTensorType::Q6_K:
+            if (numel % kQK_K != 0) return 0;
+            return static_cast<std::size_t>(numel / kQK_K) * kQ6_KBlockBytes;
         default: return 0;
     }
 }

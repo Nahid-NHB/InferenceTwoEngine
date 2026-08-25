@@ -72,9 +72,18 @@ enum class GgufTensorType : uint32_t {
     F16     = 1,
     Q4_0    = 2,
     Q4_1    = 3,
-    // ... many quantization types; see ggml.h
+    // ... (Q5_0=4, Q5_1=5, Q8_1=7 not yet wired up)
     Q8_0    = 8,
-    // ...
+    // K-quants: super-block size 256, used by llama.cpp "Q4_K_M", "Q5_K_M",
+    // "Q6_K", and most real-world Llama-family GGUFs (TinyLlama, Llama-2,
+    // Qwen2, etc.). The "K" suffix indicates a hierarchical 6-bit + 8-bit
+    // scale/min layout per super-block.
+    Q2_K    = 10,
+    Q3_K    = 11,
+    Q4_K    = 12,
+    Q5_K    = 13,
+    Q6_K    = 14,
+    // ... many more (IQ series, TQ series, etc.) — see ggml-common.h
 };
 
 std::string_view gguf_value_type_name(GgufValueType t) noexcept;
