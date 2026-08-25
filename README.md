@@ -44,6 +44,8 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ./build/bin/bench_tokenizer  # BPE encode throughput
 ./build/bin/phase1_demo     # 2-layer MLP smoke test
 ./build/bin/tinyllm         # CLI smoke test
+./build/bin/generate_demo   # end-to-end inference with random-init Llama
+                            # (greedy + top-k + top-p + sampling + Q4_0 demo)
 ```
 
 ## Layout
