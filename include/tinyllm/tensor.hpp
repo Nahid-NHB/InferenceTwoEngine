@@ -119,6 +119,12 @@ public:
     float&       at_flat(int64_t i)       noexcept;
     const float& at_flat(int64_t i) const noexcept;
 
+    // Typed element access for Int32 storage. The corresponding float
+    // accessor (above) silently reinterprets the bytes — fine for F32 but
+    // wrong for I32.
+    int32_t&       at_flat_int(int64_t i)       noexcept;
+    const int32_t& at_flat_int(int64_t i) const noexcept;
+
     // Multi-dimensional element access. Args are integer coordinates along
     // each axis (row-major). Returns the value at that logical coordinate.
     float at(std::initializer_list<int64_t> coords) const;

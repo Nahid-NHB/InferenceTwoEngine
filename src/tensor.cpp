@@ -129,6 +129,15 @@ const float& Tensor::at_flat(int64_t i) const noexcept {
     return data_float()[i];
 }
 
+int32_t& Tensor::at_flat_int(int64_t i) noexcept {
+    assert(i >= 0 && i < numel_);
+    return data_int()[i];
+}
+const int32_t& Tensor::at_flat_int(int64_t i) const noexcept {
+    assert(i >= 0 && i < numel_);
+    return data_int()[i];
+}
+
 float Tensor::at(std::initializer_list<int64_t> coords) const {
     if (coords.size() != shape_.size()) {
         throw std::invalid_argument("at: coordinate rank mismatch");

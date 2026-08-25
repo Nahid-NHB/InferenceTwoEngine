@@ -11,6 +11,7 @@ add_library(tinyllm_test_cases OBJECT
     test_rope.cpp
     test_attention.cpp
     test_mlp.cpp
+    test_model.cpp
 )
 target_include_directories(tinyllm_test_cases PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

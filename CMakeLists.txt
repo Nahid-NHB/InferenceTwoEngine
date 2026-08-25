@@ -55,6 +55,8 @@ add_library(tinyllm_core
     src/rope.cpp
     src/attention.cpp
     src/mlp.cpp
+    src/llama_block.cpp
+    src/model.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
