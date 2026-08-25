@@ -9,6 +9,8 @@ add_library(tinyllm_test_cases OBJECT
     test_gguf.cpp
     test_rmsnorm.cpp
     test_rope.cpp
+    test_attention.cpp
+    test_mlp.cpp
 )
 target_include_directories(tinyllm_test_cases PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
