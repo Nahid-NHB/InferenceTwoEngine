@@ -8,3 +8,4 @@ endfunction()
 
 tinyllm_add_bench(bench_tensor bench_tensor.cpp)
 tinyllm_add_bench(bench_matmul bench_matmul.cpp)
+tinyllm_add_bench(bench_tokenizer bench_tokenizer.cpp)

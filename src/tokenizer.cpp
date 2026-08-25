@@ -293,31 +293,22 @@ const std::string& BpeTokenizer::id_to_token(int32_t id) const {
 std::vector<int32_t> BpeTokenizer::encode(std::string_view text,
                                           bool add_bos,
                                           bool add_eos) const {
-    // 1. UTF-8 bytes -> base byte tokens.
-    std::vector<int32_t> ids;
-    ids.reserve(text.size() + 2);
+    // 1. UTF-8 bytes -> a vector of *display* strings. For bytes, we use the
+    //    actual byte as a single-char string (so the merge loop sees
+    //    "h", "i", not "<0x68>", "<0x69>"). This matches how a BPE merge
+    //    table is written: merges are "h i", not "<0x68> <0x69>".
+    std::vector<std::string> word;
+    word.reserve(text.size() + 2);
     for (unsigned char c : text) {
-        // The byte tokens are at positions 0..255 in our convention.
-        ids.push_back(static_cast<int32_t>(c));
+        // For a byte, the BPE working string is the single character
+        // corresponding to that byte. We don't write it back to the vocab;
+        // it's just the in-loop representation.
+        word.emplace_back(1, static_cast<char>(c));
     }
 
-    // 2. BPE merge loop. Represent the working word as a vector of strings.
-    //    Use the merge ranks to repeatedly merge the lowest-ranked pair.
-    //    We maintain a parallel vector of ranks-of-each-token to make pair
-    //    ranking fast.
-    //
-    //    We always rebuild the working representation as a vector of
-    //    strings (the *displayed* tokens) and ranks.
-    if (ids.size() >= 2) {
-        // Convert ids -> strings (using id_to_token_).
-        std::vector<std::string> word;
-        word.reserve(ids.size());
-        for (int32_t id : ids) {
-            word.push_back(id_to_token(id));   // for byte tokens this is "<0xNN>"
-        }
-
+    // 2. BPE merge loop.
+    if (word.size() >= 2) {
         while (word.size() >= 2) {
-            // Find the pair with the lowest rank.
             int32_t best_rank = std::numeric_limits<int32_t>::max();
             std::size_t best_idx = 0;
             bool found = false;
@@ -336,19 +327,23 @@ std::vector<int32_t> BpeTokenizer::encode(std::string_view text,
             }
             if (!found) break;
 
-            // Merge at best_idx: word[best_idx] + word[best_idx+1] -> new symbol.
-            // We look up the merged string by token_id matching (it should be in
-            // the vocab as some token id; the canonical name is the literal
-            // concatenation of the two sub-tokens).
-            std::string merged = word[best_idx] + word[best_idx + 1];
-            word[best_idx] = std::move(merged);
+            // Merge: word[best_idx] = word[best_idx] + word[best_idx+1].
+            word[best_idx] += word[best_idx + 1];
             word.erase(word.begin() + best_idx + 1);
         }
+    }
 
-        // 3. Convert word -> ids via token_to_id_.
-        ids.clear();
-        ids.reserve(word.size());
-        for (const std::string& tok : word) {
+    // 3. Convert word -> ids.
+    //    For a single-byte display string, the id is just that byte value
+    //    (because id 0..255 are byte tokens by convention). For any other
+    //    string, look up in token_to_id_; fall back to <unk>.
+    std::vector<int32_t> ids;
+    ids.reserve(word.size() + 2);
+    for (const std::string& tok : word) {
+        if (tok.size() == 1) {
+            // Single byte: id = (unsigned char)tok[0].
+            ids.push_back(static_cast<int32_t>(static_cast<unsigned char>(tok[0])));
+        } else {
             auto it = token_to_id_.find(tok);
             if (it == token_to_id_.end()) {
                 ids.push_back(unk_id());
