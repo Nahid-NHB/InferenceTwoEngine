@@ -16,7 +16,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   3   | BPE tokenizer                        |   ✅   |
 |   4   | GGUF model loader                    |   ✅   |
 |   5   | Llama-style transformer              |   ✅   |
-|   6   | KV cache                             |   ⏳   |
+|   6   | KV cache                             |   ✅   |
 |   7   | Sampling (greedy / top-k / top-p)    |   ⏳   |
 |   8   | Quantization (INT8 → INT4)           |   ⏳   |
 |   9   | Performance engineering (AVX2/512)   |   ⏳   |
@@ -34,8 +34,8 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests   # 82 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
-                            # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model)
+./build/bin/run_all_tests   # 89 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
+                            # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache)
 ./build/bin/bench_tensor    # naive matmul baseline numbers
 ./build/bin/bench_matmul    # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_tokenizer # BPE encode throughput
@@ -309,6 +309,55 @@ This phase is correctness-focused; the per-head matmul makes each
 forward pass roughly `O(n_layers * n_heads * seq^2 * head_dim)` per
 block, dominated by the softmax materialization. We'll measure in
 Phase 9.
+
+## Phase 6 notes — KV cache
+
+### What we cache
+
+For each layer we allocate a `KvCache` with K and V tensors of shape
+`[max_seq_len, n_kv_heads, head_dim]` (F32). The cache is owned by
+`LlamaModel`, one per layer.
+
+### Forward paths
+
+Two parallel paths:
+
+- `attention_forward(x, w, cfg, start_pos)` — pure. Used in tests and
+  when the caller doesn't want cache plumbing.
+- `attention_forward_cached(x, w, cfg, cache, start_pos)` — appends
+  the new K/V rows to the cache and scores against the full history.
+
+The cached path is what `LlamaModel::forward_cached` uses. Per-token
+generation now costs O(seq) per layer instead of O(seq²): the new
+K/V is a single row, attention sees `seq_k = start_pos + 1` keys.
+
+### Mask is absolute
+
+We changed the causal mask to use absolute positions. After RoPE,
+`kpos[k] > qpos` is the right condition regardless of whether `seq_q`
+equals `seq_k` (prefill) or `seq_q == 1, seq_k == start_pos + 1`
+(decode).
+
+### Bug worth noting
+
+The first cut kept two parallel implementations (one for cached, one
+for uncached) and the code drifted. Refactored to share a per-head
+kernel (`run_head`) that takes absolute `kpos[]` and `start_pos`. Both
+entry points now route through it, and the per-head loop is identical
+between the two paths.
+
+### What's tested (7 cases)
+
+- `KvCache`: construct/append/clear, capacity overflow throws, shape
+  mismatch throws
+- **Cached prefill matches uncached** (5 tokens, 2 layers, logits
+  identical within 1e-5)
+- **Cached decode matches uncached** (prefill 3 tokens, then decode
+  one at a time; at each step the cached logits for the new token
+  match what a non-cached forward over the full prefix would have
+  produced at that position)
+- `reset_caches` lets you re-prefill from position 0
+- Capacity exceeded (`max_seq_len=3`, prefill 4 tokens) throws
 
 ## License
 
