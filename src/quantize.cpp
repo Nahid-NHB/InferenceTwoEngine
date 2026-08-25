@@ -30,11 +30,16 @@ namespace tinyllm {
 // Forward declaration for the AVX2 / AVX-512 fused Q4_0 paths (see
 // matmul.cpp). Defined in tinyllm::ops::matvec_q4_0_f32_avx{2,512}; we
 // call them from matmul_q4_0_f32 when the matching ISA is enabled.
+// Phase 14: same idea for Q4_K / Q6_K.
 namespace ops {
 void matvec_q4_0_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
                           const float* x, float* y);
 void matvec_q4_0_f32_avx512(const uint8_t* qmat, int64_t M, int64_t K,
                             const float* x, float* y);
+void matvec_q4_K_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
+                          const float* x, float* y);
+void matvec_q6_K_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
+                          const float* x, float* y);
 }
 
 // =============================================================================
@@ -410,6 +415,7 @@ void dequantize_q4_K(const uint8_t* packed, int64_t n, float* dst) {
         const float dm  = quantize_f16_to_f32(dmin_h);
         const uint8_t* sc = q + 4;
         const uint8_t* qs = q + 4 + kKScaleSize;
+        const int64_t base = i * kQK_K;
 
         int is = 0;
         uint8_t sc_l, m_l;
@@ -421,8 +427,8 @@ void dequantize_q4_K(const uint8_t* packed, int64_t n, float* dst) {
             const float d2 = d * sc_l;
             const float m2 = dm * m_l;
             for (int l = 0; l < 32; ++l) {
-                dst[j + l]      = d1 * static_cast<float>(qs[l] & 0xF) - m1;
-                dst[j + l + 32] = d2 * static_cast<float>(qs[l] >> 4) - m2;
+                dst[base + j + l]      = d1 * static_cast<float>(qs[l] & 0xF) - m1;
+                dst[base + j + l + 32] = d2 * static_cast<float>(qs[l] >> 4) - m2;
             }
             qs += 32;
             is += 2;
@@ -445,6 +451,7 @@ void dequantize_q5_K(const uint8_t* packed, int64_t n, float* dst) {
         const uint8_t* sc = q + 4;
         const uint8_t* ql = q + 4 + kKScaleSize;
         const uint8_t* qh = ql + kQK_K / 2;
+        const int64_t base = i * kQK_K;
 
         int is = 0;
         uint8_t sc_l, m_l;
@@ -459,11 +466,11 @@ void dequantize_q5_K(const uint8_t* packed, int64_t n, float* dst) {
             for (int l = 0; l < 32; ++l) {
                 const int lo_l = ql[l] & 0xF;
                 const int hi_l = (qh[l] & u1) ? 16 : 0;
-                dst[j + l]      = d1 * static_cast<float>(lo_l + hi_l) - m1;
+                dst[base + j + l]      = d1 * static_cast<float>(lo_l + hi_l) - m1;
 
                 const int lo_h = ql[l] >> 4;
                 const int hi_h = (qh[l] & u2) ? 16 : 0;
-                dst[j + l + 32] = d2 * static_cast<float>(lo_h + hi_h) - m2;
+                dst[base + j + l + 32] = d2 * static_cast<float>(lo_h + hi_h) - m2;
             }
             ql += 32;
             is += 2;
@@ -486,6 +493,7 @@ void dequantize_q6_K(const uint8_t* packed, int64_t n, float* dst) {
         uint16_t d_h;
         std::memcpy(&d_h, sc + kQK_K / 16, sizeof(uint16_t));
         const float d = quantize_f16_to_f32(d_h);
+        const int64_t base = i * kQK_K;
 
         for (int n_off = 0; n_off < kQK_K; n_off += 128) {
             for (int l = 0; l < 32; ++l) {
@@ -498,10 +506,10 @@ void dequantize_q6_K(const uint8_t* packed, int64_t n, float* dst) {
                     ((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
                 const int8_t q4 = static_cast<int8_t>(
                     ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
-                dst[n_off + l +  0] = d * sc[is + 0] * static_cast<float>(q1);
-                dst[n_off + l + 32] = d * sc[is + 2] * static_cast<float>(q2);
-                dst[n_off + l + 64] = d * sc[is + 4] * static_cast<float>(q3);
-                dst[n_off + l + 96] = d * sc[is + 6] * static_cast<float>(q4);
+                dst[base + n_off + l +  0] = d * sc[is + 0] * static_cast<float>(q1);
+                dst[base + n_off + l + 32] = d * sc[is + 2] * static_cast<float>(q2);
+                dst[base + n_off + l + 64] = d * sc[is + 4] * static_cast<float>(q3);
+                dst[base + n_off + l + 96] = d * sc[is + 6] * static_cast<float>(q4);
             }
             ql += 64;
             qh += 32;
@@ -559,12 +567,20 @@ void matmul_q6_K_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
 
 void matmul_q4_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
+#if TINYLLM_ENABLE_AVX2
+    tinyllm::ops::matvec_q4_K_f32_avx2(qmat, M, K, x, y);
+#else
     matmul_q4_K_f32_reference(qmat, M, K, x, y);
+#endif
 }
 
 void matmul_q6_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
+#if TINYLLM_ENABLE_AVX2
+    tinyllm::ops::matvec_q6_K_f32_avx2(qmat, M, K, x, y);
+#else
     matmul_q6_K_f32_reference(qmat, M, K, x, y);
+#endif
 }
 
 }  // namespace tinyllm

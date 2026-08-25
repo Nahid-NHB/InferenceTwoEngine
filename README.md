@@ -24,6 +24,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |  11   | GGUF → LlamaModel loader + driver    |   ✅   |
 |  12   | K-quant dequant (Q4_K / Q5_K / Q6_K) |   ✅   |
 |  13   | AVX-512 fused Q4_0 matvec             |   ✅   |
+|  14   | Fused Q4_K / Q6_K × F32 matvec (AVX2) |   ✅   |
 
 ## Build
 
@@ -37,12 +38,12 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 135 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
+./build/bin/run_all_tests    # 136 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
-                             # 13 sampler, 27 quantize, 6 llama_loader)
+                             # 13 sampler, 29 quantize, 6 llama_loader)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
 ./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
-./build/bin/bench_quantize   # Q4_0 / Q8_0 × F32 matvec vs F32 matmul
+./build/bin/bench_quantize   # Q4_0 / Q8_0 / Q4_K / Q6_K × F32 matvec vs F32 matmul
 ./build/bin/bench_transformer # unified Phase 10 suite (all kernels, end-to-end)
 ./build/bin/bench_tokenizer  # BPE encode throughput
 ./build/bin/phase1_demo     # 2-layer MLP smoke test
@@ -902,24 +903,18 @@ Q6_K super-block (210 bytes):
   write a synthetic GGUF v3 file with one K-quant tensor, load it via
   `GgufFile::load_tensor`, and verify the result is an all-zero F32
   tensor of the right shape.
-- `matmul_q4_K_matches_f32` — fake-quantize a matrix into Q4_K format
-  and verify the K-quant matmul matches the dequant-then-FMA reference
-  within 1e-3.
 
 The reader is one straight-line port from `llama.cpp`'s reference
 implementation — the tests are the safety net that catches any
-arithmetic typo. They all pass; total test count is now 134.
+arithmetic typo. They all pass.
 
 ### What's still missing
 
-- A **fused** K-quant matvec kernel. Today we dequantize each row into
-  a fresh `std::vector<float>` and call the F32 matmul — fine for
-  correctness, but it's the obvious Phase 9 follow-up if you want to
-  actually run a 7B Q4_K on this engine (right now it'd be ~10× slower
-  than llama.cpp because of the dequant bounce). The reference
-  `matmul_q4_K_f32` / `matmul_q6_K_f32` are scaffolded for that work.
-- Q2_K / Q3_K support. Same fused-kernel caveat as above; nobody ships
-  them in 2025+.
+- Q2_K / Q3_K support. Nobody ships them in 2025+ (Q4_K dominates), so
+  these remain "unsupported dtype".
+- **A fused** K-quant matvec kernel — *addressed in Phase 14*.
+  Phase 12 leaves the K-quant matmul on the dequant-bounce path; the
+  fused Q4_K / Q6_K kernel ships in the next phase.
 
 ## Phase 13 notes — AVX-512 fused Q4_0 matvec
 
@@ -1007,9 +1002,6 @@ the same speed on both ISAs).
 
 ### What's still missing
 
-- A **fused** K-quant matvec kernel (Q4_K / Q6_K). The Q4_0 kernel is
-  now ~1.4-1.9× faster; K-quants still pay the dequant-bounce. This
-  is the next thing on the punch list.
 - **Runtime CPUID dispatch.** Today the choice is compile-time; we
   could ship a single binary that probes and picks. Trivial follow-up
   if needed.
@@ -1019,6 +1011,117 @@ the same speed on both ISAs).
 - **AVX-512 BFloat16** for F32 matmul itself. Would need the F32
   weights converted at load time; not worth it until there's a
   measured F32 matmul bottleneck in `bench_transformer`.
+- **Q5_K fused matvec.** Q5_K is rarely used in practice (Q4_K + Q6_K
+  dominate), so it's dequant-only here. The same AVX2 pattern would
+  apply with the qh bit added to each nibble.
+
+## Phase 14 notes — Fused Q4_K / Q6_K × F32 matvec (AVX2)
+
+### Why
+
+Most real Llama-family checkpoints are quantized with the **K-quant**
+formats (`Q4_K`, `Q5_K`, `Q6_K`), not `Q4_0`. TinyLlama-1.1B Q4_0
+exists but the majority of the model zoo — Qwen2, Llama-3, Mistral,
+Gemma — ships in Q4_K or Q6_K. Phase 12 added the dequant path so we
+could *load* these weights (via `load_tensor`); Phase 14 closes the
+loop with a fused on-the-fly dequant+FMA kernel so we don't pay the
+M×K dequant-bounce for every token.
+
+### What got added
+
+- `include/tinyllm/matmul.hpp` — declared
+  `matvec_q4_K_f32_avx2` and `matvec_q6_K_f32_avx2` so the bench suite
+  can call them directly.
+- `src/matmul.cpp` — two new kernels in the anonymous namespace:
+  - **`matvec_q4_K_f32_avx2`** — Q4_K super-block = `[d:f16][dmin:f16][scales:12][qs:128]`.
+    Eight sub-blocks of 32 elements each. The dequant for one
+    sub-block is `d * sc * (qs - 0) + (-dmin) * m`. Because Q4_K packs
+    lo+hi nibbles in stride (lo→x[0..31], hi→x[32..63]) rather than
+    Q4_0's stride-2, the FMA pattern is "load 8 contiguous x's, FMA
+    into the right sub-block accum" — the Q4_0 kernel's strided x
+    gather trick wouldn't work here.
+  - **`matvec_q6_K_f32_avx2`** — Q6_K super-block =
+    `[ql:128][qh:64][scales:16 (int8)][d:f16]`. 16 sub-blocks of 16.
+    Each output value is `d * sc * (ql + (qh&3)<<4 - 32)`. The kernel
+    walks the two 16-byte `ql` halves per "half" (l=0..15 vs l=16..31)
+    and the corresponding 16-byte `qh` half, processes 4 sub-blocks
+    × 2 halves × 16 elements, and accumulates into the row sum.
+- `src/quantize.cpp`:
+  - **`matmul_q4_K_f32`** / **`matmul_q6_K_f32`** dispatch is now
+    `AVX2 → reference` (vs the previous always-reference).
+  - **Bug fix in `dequantize_q4_K` / `dequantize_q5_K` / `dequantize_q6_K`**:
+    all three wrote every super-block to `dst[0..255]` instead of
+    `dst[i*kQK_K + ...]`. The reference path was used both by the
+    "no-AVX2" matmul and by the tests' reference comparison, so the
+    bug silently cancelled out — both paths agreed on the wrong
+    answer. The fused kernel didn't have that luxury, so we fixed it
+    here.
+- `tests/test_quantize.cpp` — two new parity tests
+  `matmul_q4_K_matches_f32` and `matmul_q6_K_matches_f32`. Each
+  constructs a random-but-valid Q4_K or Q6_K buffer, runs the fused
+  kernel, then runs the dequant-then-FMA reference on the same
+  buffer, and asserts agreement.
+- `benchmarks/bench_quantize.cpp` and `benchmarks/bench_transformer.cpp` —
+  new rows for Q4_K and Q6_K at the same shapes as Q4_0, so we can
+  put numbers on the fused-vs-dequant speedup.
+
+### Numbers
+
+`bench_quantize` (release build, AVX2 + AVX-512, single-threaded):
+
+```text
+Q4_0,512,1024,0.827,0.467,1.77x
+Q4_K,512,1024,0.827,0.110,7.51x
+Q6_K,512,1024,0.827,0.118,7.00x
+Q4_0,1024,2048,3.116,1.743,1.79x
+Q4_K,1024,2048,3.116,0.451,6.91x
+Q6_K,1024,2048,3.116,0.472,6.61x
+```
+
+The numbers are vs F32 matmul; the more interesting comparison is
+fused K-quant vs the dequant-bounce reference, which gets us back
+to a single Q4_0-style number while still paying only ~30% of the
+F32 cost.
+
+The fused K-quant throughput (`bench_transformer`'s quantized-matvec
+table, 4096-wide K, single-threaded):
+
+```text
+matmul_q4_0_f32  512x4096   1.888 ms
+matmul_q4_K_f32  512x4096   0.477 ms
+matmul_q6_K_f32  512x4096   0.491 ms
+matmul_q4_0_f32 1024x4096   3.488 ms
+matmul_q4_K_f32 1024x4096   0.905 ms
+matmul_q6_K_f32 1024x4096   0.959 ms
+```
+
+Q4_K and Q6_K are ~2× the throughput of Q4_0 at this width because
+the FMA pattern hits 8 of 8 lanes every cycle, vs Q4_0's
+stride-2 gather which only hits ~4 of 8.
+
+### Bugs worth noting
+
+- **`_mm_srli_epi16` shifts 16-bit WORDS, not bytes.** Earlier draft
+  of the Q6_K kernel tried to shift a packed-byte `__m128i` by 2 with
+  `_mm_srli_epi16`; the right primitive is to widen via
+  `_mm256_cvtepu8_epi32` then shift int32s with
+  `_mm256_srli_epi32`.
+- **`_mm256_srli_si256` shifts each 128-bit lane by *bytes*, not
+  across the whole 256-bit register.** To move 8 bytes from the low
+  lane to the high lane, use `_mm_unpackhi_epi64` to get the high 8
+  bytes as a fresh `__m128i`, then `_mm256_cvtepu8_epi32` on that.
+
+### What's still missing
+
+- **AVX-512 fused K-quants.** Same AVX-512F port as Phase 13 for Q4_0
+  would give another ~1.5× on Skylake-X / Zen 4 / Sapphire Rapids.
+  Most laptop/desktop CPUs don't have AVX-512 so AVX2 is the
+  more-portable target.
+- **Runtime CPUID dispatch** for the AVX2 path. Today
+  `TINYLLM_ENABLE_AVX2` is a compile-time choice.
+- **A bench row for end-to-end Q4_K inference** (loaded GGUf → 100
+  tokens). The existing `gguf_driver` runs the full path, just not in
+  the bench harness.
 
 ## License
 

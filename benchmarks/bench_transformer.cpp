@@ -23,7 +23,9 @@
 //   MLP:                  mlp_forward (SwiGLU)
 //   Llama block:          llama_block_forward + cached
 //   Quantized matvec:     matmul_q4_0_f32 (AVX-512 fused if available,
-//                        else AVX2 fused, else reference)
+//                        else AVX2 fused, else reference),
+//                        matmul_q4_K_f32 / matmul_q6_K_f32 (AVX2 fused
+//                        if compiled in, else reference)
 //   End-to-end:           llama_forward / cached
 //
 // Output is human-readable text tables + a CSV block at the bottom for
@@ -252,6 +254,78 @@ static void bench_quantize_matvec(std::vector<BenchResult>& out,
             matmul_q4_0_f32(packed.data(), M, K, x.data(), y.data());
             return y;
         }));
+
+        // Phase 14: Q4_K and Q6_K fused AVX2 kernels. Construct
+        // random-but-valid K-quant buffers per row so the kernel
+        // exercises its full dequant+FMA path.
+        constexpr std::size_t kQ4_KBlockBytes = 144;
+        constexpr std::size_t kQ6_KBlockBytes = 210;
+        const int64_t sb_per_row = K / 256;  // kQK_K = 256
+
+        // Q4_K fake-quantize: d=0.05, sc=15, qs = round(w/(d*sc)).
+        std::size_t bytes_per_row_k =
+            static_cast<std::size_t>(sb_per_row) * kQ4_KBlockBytes;
+        std::vector<uint8_t> qmat_k(static_cast<std::size_t>(M) *
+                                     bytes_per_row_k);
+        const float d_global_k = 0.05f;
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t sb = 0; sb < sb_per_row; ++sb) {
+                uint8_t* p = qmat_k.data() + m * bytes_per_row_k +
+                             sb * kQ4_KBlockBytes;
+                uint16_t d_h  = quantize_f32_to_f16(d_global_k);
+                uint16_t dm_h = quantize_f32_to_f16(0.0f);
+                std::memcpy(p,     &d_h,  sizeof(uint16_t));
+                std::memcpy(p + 2, &dm_h, sizeof(uint16_t));
+                for (int i = 0; i < 12; ++i) p[4 + i] = 15;
+                uint8_t* qs = p + 4 + 12;
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    for (int j = 0; j < 32; ++j) {
+                        int64_t idx_lo = chunk * 64 + j;
+                        int64_t idx_hi = chunk * 64 + j + 32;
+                        int lo = std::clamp(static_cast<int>(
+                            std::round(w[m * K + sb * 256 + idx_lo] /
+                                       (d_global_k * 15.0f))), 0, 15);
+                        int hi = std::clamp(static_cast<int>(
+                            std::round(w[m * K + sb * 256 + idx_hi] /
+                                       (d_global_k * 15.0f))), 0, 15);
+                        qs[chunk * 32 + j] =
+                            static_cast<uint8_t>(lo | (hi << 4));
+                    }
+                }
+            }
+        }
+        out.push_back(bench("matmul_q4_K_f32", shape, iters, [&] {
+            matmul_q4_K_f32(qmat_k.data(), M, K, x.data(), y.data());
+            return y;
+        }));
+
+        // Q6_K: random valid byte buffer (2 d, 16 scales int8, 128 ql,
+        // 64 qh per super-block).
+        std::size_t bytes_per_row_6 =
+            static_cast<std::size_t>(sb_per_row) * kQ6_KBlockBytes;
+        std::vector<uint8_t> qmat_6(static_cast<std::size_t>(M) *
+                                     bytes_per_row_6);
+        std::uniform_real_distribution<float> d_dist(0.01f, 0.1f);
+        std::uniform_int_distribution<int> sb_dist(-64, 64);
+        std::uniform_int_distribution<int> byte_dist(0, 255);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t sb = 0; sb < sb_per_row; ++sb) {
+                uint8_t* p = qmat_6.data() + m * bytes_per_row_6 +
+                             sb * kQ6_KBlockBytes;
+                uint16_t d_h = quantize_f32_to_f16(d_dist(rng));
+                std::memcpy(p, &d_h, sizeof(uint16_t));
+                for (int i = 0; i < 16; ++i)
+                    p[2 + i] = static_cast<uint8_t>(sb_dist(rng) & 0xFF);
+                for (int i = 0; i < 128; ++i)
+                    p[2 + 16 + i] = static_cast<uint8_t>(byte_dist(rng));
+                for (int i = 0; i < 64; ++i)
+                    p[2 + 16 + 128 + i] = static_cast<uint8_t>(byte_dist(rng));
+            }
+        }
+        out.push_back(bench("matmul_q6_K_f32", shape, iters, [&] {
+            matmul_q6_K_f32(qmat_6.data(), M, K, x.data(), y.data());
+            return y;
+        }));
     }
 }
 
@@ -467,7 +541,7 @@ int main(int argc, char** argv) {
     {
         std::vector<BenchResult> t;
         bench_quantize_matvec(t, rng, iters);
-        print_table(t, "Quantized matvec (Q4_0 x F32, AVX-512 fused if available, else AVX2)");
+        print_table(t, "Quantized matvec (Q4_0 x F32 AVX-512 fused; Q4_K / Q6_K x F32 AVX2 fused)");
         rows.insert(rows.end(), t.begin(), t.end());
     }
 

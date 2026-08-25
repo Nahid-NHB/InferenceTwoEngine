@@ -903,3 +903,42 @@ TEST_CASE(matmul_q4_K_matches_f32) {
         REQUIRE_NEAR(y_q[m], y_f[m], 1e-3);
     }
 }
+
+TEST_CASE(matmul_q6_K_matches_f32) {
+    // Random qmat, random x — verify the fused AVX2 kernel matches
+    // the dequant-then-FMA reference. Both routes use the same
+    // dequantize_q6_K (post the Phase 14 multi-super-block fix), so
+    // this is a true round-trip.
+    int64_t M = 4;
+    int64_t K = 2 * kQK_K;  // 2 super-blocks per row
+    std::size_t bytes_per_row = (K / kQK_K) * kQ6_KBlockBytes;
+    std::vector<uint8_t> qmat(static_cast<std::size_t>(M) * bytes_per_row);
+    std::mt19937 rng(0x5EED);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    for (auto& b : qmat) b = static_cast<uint8_t>(byte_dist(rng));
+
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<std::size_t>(K));
+    for (auto& v : x) v = dist(rng);
+
+    std::vector<float> y_q(static_cast<std::size_t>(M));
+    std::vector<float> y_f(static_cast<std::size_t>(M));
+    matmul_q6_K_f32(qmat.data(), M, K, x.data(), y_q.data());
+
+    std::vector<float> deq(static_cast<std::size_t>(M * K));
+    for (int64_t m = 0; m < M; ++m) {
+        dequantize_q6_K(qmat.data() + m * bytes_per_row, K,
+                        deq.data() + m * K);
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        double acc = 0.0;
+        for (int64_t k = 0; k < K; ++k) {
+            acc += static_cast<double>(deq[m * K + k]) *
+                   static_cast<double>(x[k]);
+        }
+        y_f[m] = static_cast<float>(acc);
+    }
+    for (int64_t mi = 0; mi < M; ++mi) {
+        REQUIRE_NEAR(y_q[mi], y_f[mi], 1e-2);
+    }
+}

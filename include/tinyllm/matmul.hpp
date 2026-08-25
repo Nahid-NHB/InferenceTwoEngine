@@ -60,4 +60,13 @@ void matvec_q4_0_f32_avx2(const std::uint8_t* qmat, std::int64_t M,
 void matvec_q4_0_f32_avx512(const std::uint8_t* qmat, std::int64_t M,
                             std::int64_t K, const float* x, float* y);
 
+// Phase 14: fused Q4_K / Q6_K × F32 matvec kernels (AVX2). Same
+// dispatch model as the Q4_0 kernels above — the static dispatch in
+// matmul_q4_K_f32 / matmul_q6_K_f32 (quantize.cpp) calls these when
+// AVX2 is compiled in. They throw std::runtime_error otherwise.
+void matvec_q4_K_f32_avx2(const std::uint8_t* qmat, std::int64_t M,
+                          std::int64_t K, const float* x, float* y);
+void matvec_q6_K_f32_avx2(const std::uint8_t* qmat, std::int64_t M,
+                          std::int64_t K, const float* x, float* y);
+
 }  // namespace tinyllm::ops

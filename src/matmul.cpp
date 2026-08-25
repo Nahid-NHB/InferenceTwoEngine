@@ -565,6 +565,348 @@ void matvec_q4_0_f32_avx512(const uint8_t* qmat, int64_t M, int64_t K,
     throw std::runtime_error("matvec_q4_0_f32_avx512: AVX-512 not available");
 #endif
 }
+// =============================================================================
+// Phase 14: AVX2 fused Q4_K × F32 matvec.
+//
+// Q4_K super-block (144 bytes): [d:f16][dmin:f16][scales:12][qs:128]
+//   - 8 sub-blocks of 32 elements, each with its own (sc, m) 6-bit pair
+//     unpacked from the scales table by get_scale_min_k4.
+//   - In each 64-element chunk (j += 64), sub-block A covers indices
+//     j..j+31 (lo nibbles) and sub-block B covers j+32..j+63 (hi nibbles).
+//   - Dequant: y[j+l]     = d*sc_l * (qs[l]&0xF)  - dmin*m_l
+//             y[j+l+32]  = d*sc_l1 * (qs[l]>>4)   - dmin*m_l1
+//
+// For the matvec we collapse (Σ q * x) per sub-block and reuse a single
+// hsum-of-x to apply the per-sub-block -dmin*m*Σx term. Q4_K layout
+// differs from Q4_0: 32 qs bytes encode 64 distinct values (lo nibble →
+// index j+l, hi nibble → index j+l+32), so each sub-block of 32 elements
+// uses *contiguous* x values, not stride-2.
+// =============================================================================
+void matvec_q4_K_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
+                          const float* x, float* y) {
+#if TINYLLM_HAVE_AVX2
+    if (K % kQK_K != 0) {
+        throw std::runtime_error("matvec_q4_K_f32_avx2: K must be divisible by 256");
+    }
+    const int64_t nb = K / kQK_K;
+    const std::size_t bytes_per_row =
+        static_cast<std::size_t>(nb) * kQ4_KBlockBytes;
+
+    auto hsum256 = [](__m256 v) -> float {
+        __m128 vlow  = _mm256_castps256_ps128(v);
+        __m128 vhigh = _mm256_extractf128_ps(v, 1);
+        vlow = _mm_add_ps(vlow, vhigh);
+        __m128 shuf = _mm_movehdup_ps(vlow);
+        __m128 sums = _mm_add_ps(vlow, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    };
+
+    for (int64_t m = 0; m < M; ++m) {
+        const uint8_t* row = qmat + m * bytes_per_row;
+        float acc = 0.0f;
+        for (int64_t bi = 0; bi < nb; ++bi) {
+            const uint8_t* bp = row + bi * kQ4_KBlockBytes;
+            uint16_t d_h, dm_h;
+            std::memcpy(&d_h,  bp,     sizeof(uint16_t));
+            std::memcpy(&dm_h, bp + 2, sizeof(uint16_t));
+            const float d  = quantize_f16_to_f32(d_h);
+            const float dm = quantize_f16_to_f32(dm_h);
+            const uint8_t* sc = bp + 4;
+            const uint8_t* qs = bp + 4 + kKScaleSize;
+            const float* xb = x + bi * kQK_K;
+
+            int is = 0;
+            for (int j = 0; j < kQK_K; j += 64) {
+                uint8_t sc_a, m_a, sc_b, m_b;
+                if (is + 0 < 4) {
+                    sc_a = sc[is + 0] & 63;
+                    m_a  = sc[is + 4] & 63;
+                } else {
+                    sc_a = static_cast<uint8_t>((sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4));
+                    m_a  = static_cast<uint8_t>((sc[is + 4] >> 4) | ((sc[is - 0] >> 6) << 4));
+                }
+                if (is + 1 < 4) {
+                    sc_b = sc[is + 1] & 63;
+                    m_b  = sc[is + 5] & 63;
+                } else {
+                    sc_b = static_cast<uint8_t>((sc[is + 5] & 0xF) | ((sc[is - 3] >> 6) << 4));
+                    m_b  = static_cast<uint8_t>((sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4));
+                }
+                const float d_sc_a  = d  * static_cast<float>(sc_a);
+                const float d_sc_b  = d  * static_cast<float>(sc_b);
+                const float dm_m_a  = dm * static_cast<float>(m_a);
+                const float dm_m_b  = dm * static_cast<float>(m_b);
+
+                const __m128i qs0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qs));
+                const __m128i qs1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qs + 16));
+                const __m128i mask = _mm_set1_epi8(static_cast<char>(0x0F));
+                const __m128i lo_n0 = _mm_and_si128(qs0, mask);
+                const __m128i hi_n0 = _mm_and_si128(_mm_srli_epi16(qs0, 4), mask);
+                const __m128i lo_n1 = _mm_and_si128(qs1, mask);
+                const __m128i hi_n1 = _mm_and_si128(_mm_srli_epi16(qs1, 4), mask);
+
+                const __m256i lo32_a = _mm256_cvtepu8_epi32(lo_n0);
+                const __m256i lo32_b = _mm256_cvtepu8_epi32(lo_n1);
+                const __m256i hi32_a = _mm256_cvtepu8_epi32(hi_n0);
+                const __m256i hi32_b = _mm256_cvtepu8_epi32(hi_n1);
+
+                auto lane_floats = [](__m256i v) -> __m256 {
+                    __m128i lo = _mm256_castsi256_si128(v);
+                    __m128i hi = _mm256_extracti128_si256(v, 1);
+                    __m128  lof = _mm_cvtepi32_ps(lo);
+                    __m128  hif = _mm_cvtepi32_ps(hi);
+                    __m256  z = _mm256_setzero_ps();
+                    __m256  l = _mm256_insertf128_ps(z, lof, 0);
+                    return _mm256_insertf128_ps(l, hif, 1);
+                };
+                const __m256 qlo_a_f = lane_floats(lo32_a);  // qs[0..7]
+                const __m256 qlo_b_f = lane_floats(lo32_b);  // qs[16..23]
+                const __m256 qhi_a_f = lane_floats(hi32_a);
+                const __m256 qhi_b_f = lane_floats(hi32_b);
+                const __m128i lo_n0_hi = _mm_unpackhi_epi64(lo_n0, lo_n0);
+                const __m128i lo_n1_hi = _mm_unpackhi_epi64(lo_n1, lo_n1);
+                const __m128i hi_n0_hi = _mm_unpackhi_epi64(hi_n0, hi_n0);
+                const __m128i hi_n1_hi = _mm_unpackhi_epi64(hi_n1, hi_n1);
+                const __m256 qlo_c_f = lane_floats(_mm256_cvtepu8_epi32(lo_n0_hi));
+                const __m256 qlo_d_f = lane_floats(_mm256_cvtepu8_epi32(lo_n1_hi));
+                const __m256 qhi_c_f = lane_floats(_mm256_cvtepu8_epi32(hi_n0_hi));
+                const __m256 qhi_d_f = lane_floats(_mm256_cvtepu8_epi32(hi_n1_hi));
+
+                const __m256 xv_lo_a = _mm256_loadu_ps(xb + j +  0);
+                const __m256 xv_lo_b = _mm256_loadu_ps(xb + j +  8);
+                const __m256 xv_lo_c = _mm256_loadu_ps(xb + j + 16);
+                const __m256 xv_lo_d = _mm256_loadu_ps(xb + j + 24);
+                const __m256 xv_hi_a = _mm256_loadu_ps(xb + j + 32);
+                const __m256 xv_hi_b = _mm256_loadu_ps(xb + j + 40);
+                const __m256 xv_hi_c = _mm256_loadu_ps(xb + j + 48);
+                const __m256 xv_hi_d = _mm256_loadu_ps(xb + j + 56);
+
+                const __m256 dotA = _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(qlo_a_f, xv_lo_a),
+                                  _mm256_mul_ps(qlo_c_f, xv_lo_b)),
+                    _mm256_add_ps(_mm256_mul_ps(qlo_b_f, xv_lo_c),
+                                  _mm256_mul_ps(qlo_d_f, xv_lo_d)));
+                const __m256 dotB = _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(qhi_a_f, xv_hi_a),
+                                  _mm256_mul_ps(qhi_c_f, xv_hi_b)),
+                    _mm256_add_ps(_mm256_mul_ps(qhi_b_f, xv_hi_c),
+                                  _mm256_mul_ps(qhi_d_f, xv_hi_d)));
+                const float sumA = hsum256(dotA);
+                const float sumB = hsum256(dotB);
+
+                const __m256 sxA = _mm256_add_ps(
+                    _mm256_add_ps(xv_lo_a, xv_lo_b),
+                    _mm256_add_ps(xv_lo_c, xv_lo_d));
+                const __m256 sxB = _mm256_add_ps(
+                    _mm256_add_ps(xv_hi_a, xv_hi_b),
+                    _mm256_add_ps(xv_hi_c, xv_hi_d));
+                const float xa = hsum256(sxA);
+                const float xb_ = hsum256(sxB);
+
+                acc += d_sc_a * sumA - dm_m_a * xa
+                     + d_sc_b * sumB - dm_m_b * xb_;
+
+                qs += 32;
+                is += 2;
+            }
+        }
+        y[m] = acc;
+    }
+#else
+    (void)qmat; (void)M; (void)K; (void)x; (void)y;
+    throw std::runtime_error("matvec_q4_K_f32_avx2: AVX2 not available");
+#endif
+}
+
+// =============================================================================
+// Phase 14: AVX2 fused Q6_K × F32 matvec.
+//
+// Q6_K super-block (210 bytes): [ql:128][qh:64][scales:16 (int8)][d:f16]
+//   - 16 sub-blocks of 16 elements; each carries its own int8 scale sc[is].
+//   - Per 32-element inner iteration (l=0..31):
+//       sub 0: q = ((ql[l]    & F) | ((qh[l] >> 0) & 3) << 4) - 32 → dst[n_off + l +  0]
+//       sub 1: q = ((ql[l+32] & F) | ((qh[l] >> 2) & 3) << 4) - 32 → dst[n_off + l + 32]
+//       sub 2: q = ((ql[l]    >> 4) | ((qh[l] >> 4) & 3) << 4) - 32 → dst[n_off + l + 64]
+//       sub 3: q = ((ql[l+32] >> 4) | ((qh[l] >> 6) & 3) << 4) - 32 → dst[n_off + l + 96]
+//     is = l/16, so l=0..15 uses sc[0/2/4/6] and l=16..31 uses sc[1/3/5/7].
+//
+// We split each inner iteration into two halves of 16 l's each, where
+// the sub-block scales are constant. Per half we have 4 sub-blocks ×
+// 16 elements of x, all contiguous, processed as 8 __m256 vectors of
+// 8 floats. Per super-block (256 elements): 2 n_off blocks × 2 halves
+// × 8 vectors of FMA = 32 FMAs + 16 hsums + 16 scale broadcasts.
+// =============================================================================
+void matvec_q6_K_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
+                          const float* x, float* y) {
+#if TINYLLM_HAVE_AVX2
+    if (K % kQK_K != 0) {
+        throw std::runtime_error("matvec_q6_K_f32_avx2: K must be divisible by 256");
+    }
+    const int64_t nb = K / kQK_K;
+    const std::size_t bytes_per_row =
+        static_cast<std::size_t>(nb) * kQ6_KBlockBytes;
+
+    auto hsum256 = [](__m256 v) -> float {
+        __m128 vlow  = _mm256_castps256_ps128(v);
+        __m128 vhigh = _mm256_extractf128_ps(v, 1);
+        vlow = _mm_add_ps(vlow, vhigh);
+        __m128 shuf = _mm_movehdup_ps(vlow);
+        __m128 sums = _mm_add_ps(vlow, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    };
+
+    for (int64_t m = 0; m < M; ++m) {
+        const uint8_t* row = qmat + m * bytes_per_row;
+        float acc = 0.0f;
+        for (int64_t bi = 0; bi < nb; ++bi) {
+            const uint8_t* bp = row + bi * kQ6_KBlockBytes;
+            const uint8_t*  ql = bp;
+            const uint8_t*  qh = ql + kQK_K / 2;
+            const int8_t*   sc_ptr = reinterpret_cast<const int8_t*>(qh + kQK_K / 4);
+            uint16_t d_h;
+            std::memcpy(&d_h, sc_ptr + kQK_K / 16, sizeof(uint16_t));
+            const float d = quantize_f16_to_f32(d_h);
+            const float* xb = x + bi * kQK_K;
+
+            for (int n_off = 0; n_off < kQK_K; n_off += 128) {
+                for (int half = 0; half < 2; ++half) {
+                    const int is = half;
+                    const int8_t* sc_p = sc_ptr + is;
+                    const __m128i qh_h = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(qh + half * 16));
+                    const __m128i ql_lo = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(ql + half * 16));
+                    const __m128i ql_hi = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(ql + half * 16 + 32));
+                    const __m128i fmask = _mm_set1_epi8(0x0F);
+
+                    // Extract the low lane (qh[0..7]) and high lane (qh[8..15]) of a
+                    // 16-byte qh register, each as a __m256i of 8 int32.
+                    auto qh_lane = [](__m128i qh_src, bool hi) -> __m256i {
+                        __m128i eight = hi ? _mm_unpackhi_epi64(qh_src, qh_src)
+                                           : qh_src;
+                        return _mm256_cvtepu8_epi32(eight);
+                    };
+                    // For each sub-block, qh contributions = (qh[l] >> sh) & 3
+                    // shifted up by 4. We need both the low and high
+                    // 8-byte halves (matching the ql half layout below).
+                    auto qh_sub = [&](int sh, bool hi) -> __m256i {
+                        __m256i bytes32 = qh_lane(qh_h, hi);
+                        bytes32 = _mm256_srli_epi32(bytes32, sh);
+                        bytes32 = _mm256_and_si256(bytes32, _mm256_set1_epi32(3));
+                        return _mm256_slli_epi32(bytes32, 4);
+                    };
+                    __m256i qh_s0_a = qh_sub(0, /*hi=*/false);
+                    __m256i qh_s1_a = qh_sub(2, /*hi=*/false);
+                    __m256i qh_s2_a = qh_sub(4, /*hi=*/false);
+                    __m256i qh_s3_a = qh_sub(6, /*hi=*/false);
+                    __m256i qh_s0_b = qh_sub(0, /*hi=*/true);
+                    __m256i qh_s1_b = qh_sub(2, /*hi=*/true);
+                    __m256i qh_s2_b = qh_sub(4, /*hi=*/true);
+                    __m256i qh_s3_b = qh_sub(6, /*hi=*/true);
+
+                    __m128i ql_s0_a = _mm_and_si128(ql_lo, fmask);
+                    __m128i ql_s0_b = _mm_unpackhi_epi64(ql_s0_a, ql_s0_a);
+                    __m128i ql_s1_a = _mm_and_si128(ql_hi, fmask);
+                    __m128i ql_s1_b = _mm_unpackhi_epi64(ql_s1_a, ql_s1_a);
+                    __m128i ql_s2_a = _mm_and_si128(_mm_srli_epi16(ql_lo, 4), fmask);
+                    __m128i ql_s2_b = _mm_unpackhi_epi64(ql_s2_a, ql_s2_a);
+                    __m128i ql_s3_a = _mm_and_si128(_mm_srli_epi16(ql_hi, 4), fmask);
+                    __m128i ql_s3_b = _mm_unpackhi_epi64(ql_s3_a, ql_s3_a);
+
+                    __m256i q6_v0_a = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s0_a), qh_s0_a);
+                    __m256i q6_v0_b = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s0_b), qh_s0_b);
+                    __m256i q6_v1_a = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s1_a), qh_s1_a);
+                    __m256i q6_v1_b = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s1_b), qh_s1_b);
+                    __m256i q6_v2_a = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s2_a), qh_s2_a);
+                    __m256i q6_v2_b = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s2_b), qh_s2_b);
+                    __m256i q6_v3_a = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s3_a), qh_s3_a);
+                    __m256i q6_v3_b = _mm256_add_epi32(
+                        _mm256_cvtepu8_epi32(ql_s3_b), qh_s3_b);
+
+                    const __m256i c32 = _mm256_set1_epi32(32);
+                    q6_v0_a = _mm256_sub_epi32(q6_v0_a, c32);
+                    q6_v0_b = _mm256_sub_epi32(q6_v0_b, c32);
+                    q6_v1_a = _mm256_sub_epi32(q6_v1_a, c32);
+                    q6_v1_b = _mm256_sub_epi32(q6_v1_b, c32);
+                    q6_v2_a = _mm256_sub_epi32(q6_v2_a, c32);
+                    q6_v2_b = _mm256_sub_epi32(q6_v2_b, c32);
+                    q6_v3_a = _mm256_sub_epi32(q6_v3_a, c32);
+                    q6_v3_b = _mm256_sub_epi32(q6_v3_b, c32);
+
+                    __m256 v0a = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v0_a),
+                        _mm256_set1_ps(static_cast<float>(sc_p[0]) * d));
+                    __m256 v0b = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v0_b),
+                        _mm256_set1_ps(static_cast<float>(sc_p[0]) * d));
+                    __m256 v1a = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v1_a),
+                        _mm256_set1_ps(static_cast<float>(sc_p[2]) * d));
+                    __m256 v1b = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v1_b),
+                        _mm256_set1_ps(static_cast<float>(sc_p[2]) * d));
+                    __m256 v2a = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v2_a),
+                        _mm256_set1_ps(static_cast<float>(sc_p[4]) * d));
+                    __m256 v2b = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v2_b),
+                        _mm256_set1_ps(static_cast<float>(sc_p[4]) * d));
+                    __m256 v3a = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v3_a),
+                        _mm256_set1_ps(static_cast<float>(sc_p[6]) * d));
+                    __m256 v3b = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(q6_v3_b),
+                        _mm256_set1_ps(static_cast<float>(sc_p[6]) * d));
+
+                    const int xb_off = n_off + half * 16;
+                    __m256 xv0a = _mm256_loadu_ps(xb + xb_off +  0);
+                    __m256 xv0b = _mm256_loadu_ps(xb + xb_off +  8);
+                    __m256 xv1a = _mm256_loadu_ps(xb + xb_off + 32);
+                    __m256 xv1b = _mm256_loadu_ps(xb + xb_off + 40);
+                    __m256 xv2a = _mm256_loadu_ps(xb + xb_off + 64);
+                    __m256 xv2b = _mm256_loadu_ps(xb + xb_off + 72);
+                    __m256 xv3a = _mm256_loadu_ps(xb + xb_off + 96);
+                    __m256 xv3b = _mm256_loadu_ps(xb + xb_off +104);
+
+                    const __m256 chunk_a = _mm256_add_ps(
+                        _mm256_add_ps(_mm256_mul_ps(v0a, xv0a),
+                                      _mm256_mul_ps(v1a, xv1a)),
+                        _mm256_add_ps(_mm256_mul_ps(v2a, xv2a),
+                                      _mm256_mul_ps(v3a, xv3a)));
+                    const __m256 chunk_b = _mm256_add_ps(
+                        _mm256_add_ps(_mm256_mul_ps(v0b, xv0b),
+                                      _mm256_mul_ps(v1b, xv1b)),
+                        _mm256_add_ps(_mm256_mul_ps(v2b, xv2b),
+                                      _mm256_mul_ps(v3b, xv3b)));
+                    acc += hsum256(chunk_a) + hsum256(chunk_b);
+                }
+                ql += 64;
+                qh += 32;
+                sc_ptr += 8;
+            }
+        }
+        y[m] = acc;
+    }
+#else
+    (void)qmat; (void)M; (void)K; (void)x; (void)y;
+    throw std::runtime_error("matvec_q6_K_f32_avx2: AVX2 not available");
+#endif
+}
+
 
 namespace {
 
