@@ -49,6 +49,7 @@ add_library(tinyllm_core
     src/tensor.cpp
     src/memory.cpp
     src/matmul.cpp
+    src/tokenizer.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
