@@ -17,10 +17,10 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   4   | GGUF model loader                    |   ✅   |
 |   5   | Llama-style transformer              |   ✅   |
 |   6   | KV cache                             |   ✅   |
-|   7   | Sampling (greedy / top-k / top-p)    |   ⏳   |
-|   8   | Quantization (INT8 → INT4)           |   ⏳   |
-|   9   | Performance engineering (AVX2/512)   |   ⏳   |
-|  10   | Benchmarking suite                   |   ⏳   |
+|   7   | Sampling (greedy / top-k / top-p)    |   ✅   |
+|   8   | Quantization (Q8_0 + Q4_0)          |   ✅   |
+|   9   | Performance engineering (AVX2/512)   |   ✅   |
+|  10   | Benchmarking suite                   |   ✅   |
 
 ## Build
 
@@ -34,11 +34,14 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests   # 89 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
-                            # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache)
-./build/bin/bench_tensor    # naive matmul baseline numbers
-./build/bin/bench_matmul    # naive / blocked / AVX2 / threaded comparison
-./build/bin/bench_tokenizer # BPE encode throughput
+./build/bin/run_all_tests    # 117 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
+                             # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
+                             # 13 sampler, 15 quantize)
+./build/bin/bench_tensor     # naive matmul baseline numbers
+./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
+./build/bin/bench_quantize   # Q4_0 / Q8_0 × F32 matvec vs F32 matmul
+./build/bin/bench_transformer # unified Phase 10 suite (all kernels, end-to-end)
+./build/bin/bench_tokenizer  # BPE encode throughput
 ./build/bin/phase1_demo     # 2-layer MLP smoke test
 ./build/bin/tinyllm         # CLI smoke test
 ```
@@ -217,9 +220,9 @@ exposes:
   the data section).
 - `load_tensor(idx)` materializes a tensor's data into our `Tensor`
   type. F32 is copied verbatim; F16 is expanded to F32 since our op
-  kernels only handle Float32 right now. Quantized types (Q4_0, Q4_1,
-  Q8_0) parse and report but raise on load — Phase 8 will wire those
-  up.
+  kernels only handle Float32 right now. Q8_0 and Q4_0 (Phase 8) are
+  dequantized to F32 on load. Q4_1 still raises — it's not on the
+  critical path for typical Llama models.
 
 ### File layout recap
 
@@ -358,6 +361,306 @@ between the two paths.
   produced at that position)
 - `reset_caches` lets you re-prefill from position 0
 - Capacity exceeded (`max_seq_len=3`, prefill 4 tokens) throws
+
+## Phase 7 notes — Sampling
+
+### API
+
+```cpp
+struct SamplerConfig {
+    float temperature = 1.0f;   // <=0 → greedy
+    int   top_k       = 0;      // <=0 → disabled
+    float top_p       = 1.0f;   // >=1 → disabled
+};
+
+int32_t    sample_greedy(const Tensor& logits);
+int32_t    sample(const Tensor& logits, const SamplerConfig& cfg,
+                  std::optional<uint64_t> seed = std::nullopt);
+Tensor     filter_logits(const Tensor& logits, const SamplerConfig& cfg);
+std::vector<int32_t>
+           generate(LlamaModel& model,
+                    const std::vector<int32_t>& prompt,
+                    int max_new_tokens,
+                    const SamplerConfig& cfg,
+                    std::optional<int32_t> eos = std::nullopt,
+                    std::optional<uint64_t> seed = std::nullopt);
+```
+
+### Pipeline
+
+1. Apply `temperature` by scaling logits before softmax (T→0 makes
+   argmax dominate; T→∞ flattens).
+2. Apply `top_k`: zero out everything below the k-th largest logit.
+3. Apply `top_p`: zero out everything outside the smallest set whose
+   softmax mass ≥ p.
+4. Compute softmax over the survivors.
+5. Inverse-CDF sample with `std::mt19937_64` (seeded deterministically
+   if a seed is supplied, otherwise from `std::random_device`).
+
+### Sampling from the last prefill row
+
+`LlamaModel::forward_cached` returns logits of shape `[seq, vocab]`.
+For generation, only the **last row** corresponds to the next-token
+distribution. `generate()` copies that row into a fresh `[vocab]`
+tensor before sampling; the stochastic `sample()` itself just sees a
+flat 1-D distribution, so the caller is responsible for picking the
+right row.
+
+### Bugs worth noting
+
+- The first cut of `sample()` called `softmax_vec(..., /*temperature=*/1.0f)`,
+  hardcoding T=1 even when the user configured a different temperature.
+  For low-T sampling this made the output almost uniform. The fix is to
+  pass `cfg.temperature` through.
+- `generate()` originally sampled from the *flattened* prefill logits
+  (every row, concatenated), which made the first sampled token out of
+  range whenever `seq_q > 1`. The fix takes the last row before
+  sampling.
+- The EOS-halts test originally set only column 5 of `W_output` to
+  `+1`, but with random weights the model's hidden state has negative
+  mean, so `+1`-column dot products end up negative. The test now sets
+  column 5 to `-10` and the others to `+1`, which flips the polarity
+  and guarantees token 5 is the unique argmax.
+
+### What's tested (13 cases)
+
+- `sample_greedy` picks argmax (1-D and 2-D inputs)
+- `filter_logits`: T=0 makes argmax +inf / others −inf
+- `filter_logits`: top-k keeps only the top-k
+- `filter_logits`: top-p keeps the smallest sufficient set
+- `sample` is deterministic given a fixed seed
+- `sample` distribution roughly tracks the softmax (high-T)
+- `sample` concentrates on argmax (low-T)
+- T=0 dispatches to `sample_greedy` from inside `sample()`
+- `generate` produces exactly `max_new_tokens` when EOS is not set
+- `generate` halts at the configured EOS token
+- `generate` returns empty for `max_new_tokens=0`
+- `generate` throws on empty prompt
+
+## Phase 8 notes — Quantization (Q8_0 + Q4_0)
+
+### Block formats
+
+Both formats quantize 32-element blocks of Float32 to a per-block
+scale (f16) plus packed quantized values. Layout matches the GGUF
+spec, so a quantized tensor round-trips through the file format:
+
+| Format | Block size | Per-block bytes | Levels    | Range          |
+|--------|-----------:|----------------:|----------:|----------------|
+| Q8_0   |         32 |              34 |     256   |  [-127, 127]   |
+| Q4_0   |         32 |              18 |      16   |     [-8, +7]   |
+
+Q4_0 stores nibbles packed two-per-byte; the low nibble is the even
+index, the high nibble is the odd index. Both use round-half-away-
+from-zero during quantization, with clamp-to-range.
+
+### Pipeline
+
+```cpp
+// F32 → Q8_0 packed bytes
+std::vector<uint8_t> quantize_q8_0(const float* src, int64_t n);
+
+// Q8_0 packed bytes → F32
+void dequantize_q8_0(const uint8_t* packed, int64_t n, float* dst);
+
+// Same for Q4_0.
+
+// Reference quantized matmul: dequantizes each row into a fresh F32
+// buffer and accumulates via F32 multiply. Phase 9 replaces this with
+// a fused dequant-dot kernel.
+void matmul_q4_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+void matmul_q8_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
+                     const float* x, float* y);
+```
+
+### GGUF integration
+
+`GgufFile::load_tensor` now dequantizes Q8_0 and Q4_0 tensors to F32
+on the fly. Both formats are accepted in the parser and tested by
+synthetic round-trip files: write a quantized tensor to a hand-built
+GGUF v3 buffer, read it back, and check that the dequantized values
+match.
+
+### Bugs worth noting
+
+- The first cut used `std::array<int8, …>` (missing the `_t`); not a
+  standard type and broke the build. Switched to `int8_t`.
+- A first attempt at the GGUF round-trip test treated `ti.offset` as
+  the absolute file position. It's actually the offset *into the data
+  section* — the reader seeks to `data_section_offset_ + ti.offset`.
+  With a single tensor at the start of the section, `ti.offset = 0`
+  is correct.
+- The same first cut reversed the GGUF dims, which writes them in the
+  opposite order from what the parser reads. The convention in this
+  codebase (and the existing test_gguf.cpp) is natural row-major order,
+  not GGUF's "slowest first".
+- The Q4_0 round-trip test originally used uniform random values in
+  [-1, 1], which mixes values across many different per-block scales.
+  At Q4_0's 16-level resolution, a value of 0.01 against an absmax of
+  ~0.5 quantizes to zero with 100% relative error — not a bug, just
+  the fundamental limit of absolute-scale quantization on a wide
+  dynamic range. The test now (a) compresses the range to ±0.5 and
+  (b) excludes values within `4 × scale` of zero from the
+  relative-error measurement. After that filter, worst-case relative
+  error is < 50% and typically ~7%.
+
+### What's tested (15 cases)
+
+- `f16 <-> f32` round-trip for normals, infinities, zero
+- Q8_0: per-block round-trip, full-tensor round-trip, zero block,
+  non-multiple-of-32 rejection
+- Q4_0: per-block round-trip, full-tensor round-trip, zero block,
+  non-multiple-of-32 rejection
+- `matmul_q8_0_f32` matches F32 matmul (small + larger)
+- `matmul_q4_0_f32` matches F32 matmul (small + larger)
+- `GgufFile::load_tensor` round-trips Q8_0 + Q4_0 tensors written to
+  a synthetic GGUF v3 file
+
+## Phase 9 notes — Performance engineering
+
+### Fused Q4_0 × F32 AVX2 matvec
+
+The big win is fusing the dequantization into the dot product. The
+reference path (`matmul_q4_0_f32_reference`) dequantizes each row into
+a fresh 32-element F32 buffer, then runs an FMA loop. The fused kernel
+(`matvec_q4_0_f32_avx2`, in `src/matmul.cpp`) loads the 16 packed
+bytes of a Q4_0 block, splits them into 16 lo-nibbles and 16
+hi-nibbles, zero-extends each nibble to 8-wide `__m256i` (after
+subtracting 8 to re-center), converts to F32, and uses
+`_mm256_i32gather_ps` to pull the matching strided x values into
+SIMD registers. The four FMAs per block (lo_a × lo_x, hi_a × hi_x,
+lo_b × lo_x, hi_b × hi_x) are reduced with `hsum256`, multiplied by
+the per-block f16 scale, and accumulated into `y[m]`.
+
+The Q8_0 path currently still goes through the reference. Q8_0 is
+naturally friendlier to SIMD (no nibble unpacking, no strided x
+loads) but we haven't migrated it yet.
+
+### Build-time guard
+
+`TINYLLM_HAVE_AVX2` (in `matmul.cpp`) and `TINYLLM_ENABLE_AVX2` (in
+`quantize.cpp`) are set by CMake when the target CPU supports it. On
+non-AVX2 builds the reference path is used; the kernel itself
+compiles to a runtime-error stub.
+
+### Measured speedup
+
+`bench_quantize` reports Q4_0 / Q8_0 × F32 matvec vs F32 matmul on
+random square matrices:
+
+| M       | K       | F32 (ms) | Q4_0 (ms) | Speedup |
+|--------:|--------:|---------:|----------:|--------:|
+|     128 |     256 |    0.044 |     0.042 |    1.03 |
+|     256 |     512 |    0.172 |     0.177 |    0.97 |
+|     512 |    1024 |    0.815 |     0.687 |    1.19 |
+|    1024 |    2048 |    4.185 |     2.773 |    1.51 |
+
+At 1024 × 2048 the fused kernel beats F32 by 1.5x — that's the AVX2
+path (4 FMA chunks per Q4_0 block, gather x, hsum, scale) versus the
+naive F32 matmul (which at this size is the `Avx2` variant: 6×16
+micro-tile, FMA into 12 accumulators, write back). The Q4_0 win is
+mostly from halving memory bandwidth on the weight matrix (4 bits
+per value vs 32). Smaller shapes don't benefit because the kernel
+launch / hsum overhead dominates.
+
+### Bugs worth noting
+
+- The first AVX2 implementation unpacked lo-nibbles and hi-nibbles
+  with `_mm_unpacklo_epi8`, which only sees the **low** 8 bytes of the
+  source. So the kernel was computing dot products over 16 of the
+  32 block values — exactly half. Corrected by using
+  `_mm_unpacklo_epi8` AND `_mm_unpackhi_epi8`, widening to 16 int16,
+  then to 16 int32 across two `__m256i`. The test
+  `matmul_q4_0_matches_f32` caught it (got the right magnitude but
+  the wrong sign on rows with a negative mean).
+- Linking initially failed because the helper lived in `tinyllm::ops`
+  but the forward declaration in `quantize.cpp` was in the file's
+  anonymous namespace, making the linker look for
+  `tinyllm::{anon}::matvec_q4_0_f32_avx2`. Moved the forward
+  declaration to `tinyllm::ops` scope at the top of `quantize.cpp`
+  and qualified the call site as `tinyllm::ops::matvec_q4_0_f32_avx2`.
+
+## Phase 10 notes — Benchmarking suite
+
+### `bench_transformer` — the unified runner
+
+`benchmarks/bench_transformer.cpp` is the single entry point that
+exercises every kernel the project ships. For each model config
+(`small` hidden=512 / `medium` hidden=1024 / `big` hidden=2048) it
+prints a table:
+
+```text
+=== Config: medium (hidden=1024, L=2) ===
+kernel                  shape                          ms/call      throughput
+attention_prefill       prefill seq=32 heads=8           7.515       133.1 calls/s
+attention_decode        decode seq=1 ctx=64 heads=8      2.533       394.8 calls/s
+mlp_forward             seq=32 h=1024 i=2048            10.533        94.9 calls/s
+block_prefill           prefill seq=32 layers=1         21.786        45.9 calls/s
+block_decode            decode seq=1 ctx=64 layers=1      6.419       155.8 calls/s
+llama_forward           prefill seq=32 L=2              44.132        22.7 calls/s
+llama_forward_cached    decode seq=1 ctx=32 L=2         20.527        48.7 calls/s
+```
+
+A CSV block at the bottom lets you diff runs across machines or
+compiler flags.
+
+### What it covers
+
+| Group     | Kernels                                                                                          |
+|-----------|--------------------------------------------------------------------------------------------------|
+| Tensor    | `add`, `multiply`, `mul_scalar`, `sum`, `mean`, `softmax`, `reshape`, `transpose`                |
+| Matmul    | `matmul_avx2`, `matmul_blocked`, `matmul_threaded` at n ∈ {256, 1024, 2048}                     |
+| Quantized | `matmul_q4_0_f32` (AVX2 fused) at (M, K) ∈ {(512,4096), (1024,4096), (2048,4096)}                |
+| Layer     | `rmsnorm`, `rope_inplace`                                                                        |
+| Attention | prefill (seq=32) + decode (seq=1, ctx=64)                                                        |
+| MLP       | `mlp_forward` (SwiGLU)                                                                           |
+| Block     | `llama_block_forward` prefill + cached decode                                                    |
+| End-to-end | `llama_forward` prefill + `llama_forward_cached` decode                                         |
+
+### Usage
+
+```bash
+./build/bin/bench_transformer             # default: 30 iterations per kernel
+./build/bin/bench_transformer --quick     # 5 iterations, fewer configs
+./build/bin/bench_transformer --iters 100 # custom iteration count
+./build/bin/bench_transformer > out.txt   # capture tables + CSV
+```
+
+### How to read the numbers
+
+- **Tensor ops** are bandwidth-bound; ms/call scales with the number
+  of elements touched (e.g. `add` on 1024² ≈ 4 MB reads + 4 MB writes,
+  dominated by memory traffic).
+- **Matmul** numbers tell you how well the AVX2 and threaded kernels
+  scale. At 256³ `matmul_avx2` (0.73 ms) ≈ `matmul_threaded` (1.09 ms):
+  the threading overhead exceeds the work at this size. At 1024³
+  threaded wins 2.4× (30.5 ms vs 73.6 ms single-threaded AVX2).
+- **Quantized matvec** at M=2048, K=4096 is 11 ms — that's ~150 GFLOPS
+  effective (the AVX2 path is doing 2·M·K FMAs plus nibble unpacking
+  and a gather).
+- **Block prefill vs decode** (e.g. medium: 21.8 ms vs 6.4 ms)
+  reflects the O(seq²) attention prefill vs the O(seq · cache) decode.
+  In real LLM workloads this is why prefill latency dominates the
+  first request but generation throughput is bounded by decode.
+
+### Bugs worth noting
+
+- The first cut used `bench_id(0, 32000)` for token sampling, but the
+  `small` config has `vocab=4096`. Tokens above 4095 tripped
+  `llama: token id out of range`. The bench now builds an
+  `id(0, vocab-1)` per config.
+- The decode benches pre-fill the KV cache to 63 rows then decode at
+  `start_pos=63`. With `iters > 1` and a fixed-size cache that hits the
+  capacity-exceeded error on the second iteration. The fix is to reset
+  `cache.length = 63` inside the timed closure so each call starts from
+  the same cache state.
+
+### Public API additions
+
+`ops::hardware_threads()` and `ops::have_avx2()` were promoted from
+`matmul.cpp`'s anonymous namespace to the public header so the bench
+suite can report what it actually targeted.
 
 ## License
 

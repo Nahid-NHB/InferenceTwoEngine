@@ -21,6 +21,7 @@
 
 #include "tinyllm/matmul.hpp"
 
+#include "tinyllm/quantize.hpp"
 #include "tinyllm/tensor.hpp"
 
 #include <algorithm>
@@ -328,6 +329,140 @@ Tensor matmul_threaded_impl(const Tensor& a, const Tensor& b) {
 }
 
 // -----------------------------------------------------------------------------
+// Fused Q4_0 × F32 (vector) dot product kernel.
+//
+// Computes y[m] = sum_k Q4_0[m, k] * x[k] for m in [0, M), with Q4_0
+// packed bytes in row-major order and x a 1-D float vector. This is
+// the workhorse for Llama-style MLPs: each row of the weight matrix
+// is a Q4_0 block, the activations x are F32, and we accumulate one
+// row at a time.
+//
+// Strategy (per row m):
+//   For each 32-element block:
+//     1. Load 16 packed bytes of nibbles (each byte holds two nibbles).
+//     2. Split into low and high nibbles; unsigned-extend each to int32.
+//     3. Subtract 8 to re-center the symmetric range to [-8, +7].
+//     4. Convert to F32, FMA against x[block_offset + 0..8] and
+//        x[block_offset + 8..16].
+//     5. Horizontal-sum the two 8-wide accumulators → block dot
+//        product (without scale).
+//     6. Multiply by the per-block f16 scale, accumulate into y[m].
+//
+// The horizontal-sum happens once per block, so we don't accumulate
+// across blocks in SIMD registers (each block has its own scale).
+// Falls back to scalar on non-AVX2.
+// -----------------------------------------------------------------------------
+
+// Public API used by tinyllm::matmul_q4_0_f32 (in quantize.cpp).
+// Lives in tinyllm::ops so it doesn't collide with the q4_0 reference
+// functions in tinyllm's anonymous namespace. The function itself does an
+// internal #if so it always compiles; on non-AVX2 it throws.
+}  // close the anon namespace here so the next fn is in tinyllm::ops
+
+void matvec_q4_0_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
+                          const float* x, float* y) {
+#if TINYLLM_HAVE_AVX2
+    if (K % kQ4_0BlockSize != 0) {
+        throw std::runtime_error("matvec_q4_0_f32: K must be divisible by 32");
+    }
+    int64_t nblocks = K / kQ4_0BlockSize;
+    std::size_t bytes_per_row = static_cast<std::size_t>(nblocks * kQ4_0BlockBytes);
+
+    // Horizontal sum of an __m256 → float. Local helper.
+    auto hsum256 = [](__m256 v) -> float {
+        __m128 vlow  = _mm256_castps256_ps128(v);
+        __m128 vhigh = _mm256_extractf128_ps(v, 1);
+        vlow = _mm_add_ps(vlow, vhigh);
+        __m128 shuf = _mm_movehdup_ps(vlow);
+        __m128 sums = _mm_add_ps(vlow, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        return _mm_cvtss_f32(sums);
+    };
+
+    for (int64_t m = 0; m < M; ++m) {
+        const uint8_t* row = qmat + m * bytes_per_row;
+        float sum = 0.0f;
+        for (int64_t bi = 0; bi < nblocks; ++bi) {
+            const uint8_t* bp = row + bi * kQ4_0BlockBytes;
+            uint16_t sh;
+            std::memcpy(&sh, bp, sizeof(sh));
+            const float scale = quantize_f16_to_f32(sh);
+            const float* xb = x + bi * 32;
+
+            // Load 16 packed bytes; each byte = (hi nibble << 4) | lo nibble.
+            // lo_n: 16 lo-nibbles (one per byte) → 16 unsigned values in [0,15].
+            // hi_n: 16 hi-nibbles (one per byte) → 16 unsigned values in [0,15].
+            const __m128i bytes = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(bp + 2));
+            const __m128i zero = _mm_setzero_si128();
+            const __m128i mask = _mm_set1_epi8(static_cast<char>(0x0F));
+            const __m256i eight32 = _mm256_set1_epi32(8);
+            const __m128i lo_n = _mm_and_si128(bytes, mask);
+            const __m128i hi_n = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+
+            // Split into lo/hi halves and widen each to 8 int32:
+            //   16 int8 → 16 int16 (split across two __m128) → 16 int32
+            //   across two __m256i, then subtract 8 to re-center to [-8,+7].
+            const __m128i lo16_lo = _mm_unpacklo_epi8(lo_n, zero);  // 8 int16
+            const __m128i lo16_hi = _mm_unpackhi_epi8(lo_n, zero);  // 8 int16
+            const __m256i lo32_a = _mm256_sub_epi32(
+                _mm256_cvtepi16_epi32(lo16_lo), eight32);
+            const __m256i lo32_b = _mm256_sub_epi32(
+                _mm256_cvtepi16_epi32(lo16_hi), eight32);
+
+            const __m128i hi16_lo = _mm_unpacklo_epi8(hi_n, zero);
+            const __m128i hi16_hi = _mm_unpackhi_epi8(hi_n, zero);
+            const __m256i hi32_a = _mm256_sub_epi32(
+                _mm256_cvtepi16_epi32(hi16_lo), eight32);
+            const __m256i hi32_b = _mm256_sub_epi32(
+                _mm256_cvtepi16_epi32(hi16_hi), eight32);
+
+            // Convert to F32. A Q4_0 block has lo-nibbles at even indices
+            // and hi-nibbles at odd indices of the dequantized row, so the
+            // dot product is
+            //   Σ (q_i - 8) * x[i] = Σ lo[i] * x[2i] + Σ hi[i] * x[2i+1]
+            // We need 8 strided x values (every other float) per lo/hi
+            // vector. AVX2 has _mm256_i32gather_ps for exactly this.
+            const __m256 qlo_a_f = _mm256_cvtepi32_ps(lo32_a);
+            const __m256 qlo_b_f = _mm256_cvtepi32_ps(lo32_b);
+            const __m256 qhi_a_f = _mm256_cvtepi32_ps(hi32_a);
+            const __m256 qhi_b_f = _mm256_cvtepi32_ps(hi32_b);
+
+            // Index vectors for gather (stride 4 bytes = sizeof(float)).
+            // chunk_a covers pairs 0..7  → x positions {0,2,4,6,8,10,12,14} for lo,
+            //                                       {1,3,5,7,9,11,13,15} for hi.
+            // chunk_b covers pairs 8..15 → x positions {16,18,20,22,24,26,28,30}
+            //                                       {17,19,21,23,25,27,29,31}.
+            const __m256i idx_lo_a = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+            const __m256i idx_hi_a = _mm256_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15);
+            const __m256i idx_lo_b = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
+            const __m256i idx_hi_b = _mm256_setr_epi32(17, 19, 21, 23, 25, 27, 29, 31);
+            const __m256 xv_lo_a = _mm256_i32gather_ps(xb, idx_lo_a, 4);
+            const __m256 xv_hi_a = _mm256_i32gather_ps(xb, idx_hi_a, 4);
+            const __m256 xv_lo_b = _mm256_i32gather_ps(xb, idx_lo_b, 4);
+            const __m256 xv_hi_b = _mm256_i32gather_ps(xb, idx_hi_b, 4);
+
+            const __m256 dotv =
+                _mm256_add_ps(
+                    _mm256_add_ps(_mm256_mul_ps(qlo_a_f, xv_lo_a),
+                                  _mm256_mul_ps(qhi_a_f, xv_hi_a)),
+                    _mm256_add_ps(_mm256_mul_ps(qlo_b_f, xv_lo_b),
+                                  _mm256_mul_ps(qhi_b_f, xv_hi_b)));
+            const float dot = hsum256(dotv);
+            sum += dot * scale;
+        }
+        y[m] = sum;
+    }
+#else
+    (void)qmat; (void)M; (void)K; (void)x; (void)y;
+    throw std::runtime_error("matvec_q4_0_f32: AVX2 not available");
+#endif
+}
+
+namespace {
+
+// -----------------------------------------------------------------------------
 // Dispatcher
 // -----------------------------------------------------------------------------
 MatmulVariant pick_best(MatmulVariant v) {
@@ -348,6 +483,8 @@ MatmulVariant pick_best(MatmulVariant v) {
 MatmulVariant last_picked_variant() noexcept {
     return static_cast<MatmulVariant>(g_last_variant.load(std::memory_order_relaxed));
 }
+int  hardware_threads() noexcept { return CpuFeatures::get().hardware_threads; }
+bool have_avx2() noexcept { return CpuFeatures::get().avx2; }
 std::string_view variant_name(MatmulVariant v) noexcept {
     switch (v) {
         case MatmulVariant::Auto:     return "auto";

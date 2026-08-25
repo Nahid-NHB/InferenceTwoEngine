@@ -14,6 +14,8 @@
 // -----------------------------------------------------------------------------
 #include "tinyllm/gguf.hpp"
 
+#include "tinyllm/quantize.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -269,6 +271,44 @@ Tensor GgufFile::load_tensor(std::size_t idx) const {
                 }
                 std::memcpy(&f32[static_cast<std::size_t>(i)], &bits, sizeof(float));
             }
+            return Tensor(std::move(shape), DType::Float32,
+                          f32.data(), f32.size() * sizeof(float));
+        }
+        case GgufTensorType::Q8_0: {
+            if (n % kQ8_0BlockSize != 0) {
+                throw std::runtime_error("GgufFile::load_tensor: Q8_0 tensor " +
+                                         ti.name + " size " + std::to_string(n) +
+                                         " not divisible by 32");
+            }
+            int64_t nblocks = n / kQ8_0BlockSize;
+            std::vector<uint8_t> packed(static_cast<std::size_t>(nblocks * kQ8_0BlockBytes));
+            f.read(reinterpret_cast<char*>(packed.data()),
+                   static_cast<std::streamsize>(nblocks * kQ8_0BlockBytes));
+            if (static_cast<int64_t>(f.gcount()) != nblocks *
+                                                    static_cast<int64_t>(kQ8_0BlockBytes)) {
+                throw std::runtime_error("GgufFile::load_tensor: truncated Q8_0 read for " + ti.name);
+            }
+            std::vector<float> f32(static_cast<std::size_t>(n));
+            dequantize_q8_0(packed.data(), n, f32.data());
+            return Tensor(std::move(shape), DType::Float32,
+                          f32.data(), f32.size() * sizeof(float));
+        }
+        case GgufTensorType::Q4_0: {
+            if (n % kQ4_0BlockSize != 0) {
+                throw std::runtime_error("GgufFile::load_tensor: Q4_0 tensor " +
+                                         ti.name + " size " + std::to_string(n) +
+                                         " not divisible by 32");
+            }
+            int64_t nblocks = n / kQ4_0BlockSize;
+            std::vector<uint8_t> packed(static_cast<std::size_t>(nblocks * kQ4_0BlockBytes));
+            f.read(reinterpret_cast<char*>(packed.data()),
+                   static_cast<std::streamsize>(nblocks * kQ4_0BlockBytes));
+            if (static_cast<int64_t>(f.gcount()) != nblocks *
+                                                    static_cast<int64_t>(kQ4_0BlockBytes)) {
+                throw std::runtime_error("GgufFile::load_tensor: truncated Q4_0 read for " + ti.name);
+            }
+            std::vector<float> f32(static_cast<std::size_t>(n));
+            dequantize_q4_0(packed.data(), n, f32.data());
             return Tensor(std::move(shape), DType::Float32,
                           f32.data(), f32.size() * sizeof(float));
         }

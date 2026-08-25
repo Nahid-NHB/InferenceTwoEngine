@@ -43,4 +43,9 @@ Tensor matmul_threaded(const Tensor& a, const Tensor& b);
 MatmulVariant last_picked_variant() noexcept;
 std::string_view variant_name(MatmulVariant v) noexcept;
 
+// CPU feature summary. Used by the benchmarking suite to print what
+// the build actually targets.
+int  hardware_threads() noexcept;
+bool have_avx2() noexcept;
+
 }  // namespace tinyllm::ops
