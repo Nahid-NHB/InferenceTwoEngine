@@ -52,6 +52,7 @@ add_library(tinyllm_core
     src/tokenizer.cpp
     src/gguf.cpp
     src/rmsnorm.cpp
+    src/rope.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

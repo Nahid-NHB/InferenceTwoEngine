@@ -8,6 +8,7 @@ add_library(tinyllm_test_cases OBJECT
     test_tokenizer.cpp
     test_gguf.cpp
     test_rmsnorm.cpp
+    test_rope.cpp
 )
 target_include_directories(tinyllm_test_cases PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
