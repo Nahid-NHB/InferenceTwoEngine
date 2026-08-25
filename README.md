@@ -15,7 +15,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   2   | Matmul: blocking, SIMD, threading    |   ✅   |
 |   3   | BPE tokenizer                        |   ✅   |
 |   4   | GGUF model loader                    |   ✅   |
-|   5   | Llama-style transformer              |   ⏳   |
+|   5   | Llama-style transformer              |   ✅   |
 |   6   | KV cache                             |   ⏳   |
 |   7   | Sampling (greedy / top-k / top-p)    |   ⏳   |
 |   8   | Quantization (INT8 → INT4)           |   ⏳   |
@@ -34,7 +34,8 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests   # 54 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf)
+./build/bin/run_all_tests   # 82 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
+                            # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model)
 ./build/bin/bench_tensor    # naive matmul baseline numbers
 ./build/bin/bench_matmul    # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_tokenizer # BPE encode throughput
@@ -248,6 +249,66 @@ loaded zeros because the reader's seek was 8..24 bytes short.
 - Bad magic rejected
 - Unsupported version rejected
 - Dtype name lookups
+
+## Phase 5 notes — Llama-style transformer
+
+### Pieces
+
+```
+include/tinyllm/
+├── rmsnorm.hpp       # y = (x / sqrt(mean(x²) + eps)) * gamma
+├── rope.hpp          # rotary position embeddings (Llama half-rotation)
+├── attention.hpp     # GQA attention with RoPE + causal mask
+├── mlp.hpp           # SwiGLU MLP: down(silu(gate) * up)
+├── llama_block.hpp   # one block: residual + pre-norm attn + residual + pre-norm mlp
+└── model.hpp         # embed → n_layers × block → final norm → unembed
+```
+
+### Design choices
+
+- **Pre-norm** everywhere (Llama 2/3 style). Each sub-block takes a
+  residual: `x = x + sub(rmsnorm(x))`.
+- **GQA**: `n_kv_heads ≤ n_heads`. K and V are projected into a smaller
+  space, then broadcast to all `n_heads` query heads via `repeat_interleave`.
+  Smaller memory footprint for the KV cache (Phase 6).
+- **Per-head matmul in Phase 5**. We could batch heads into one big
+  matmul, but per-head keeps the code obvious. Phase 9 will fold this.
+- **RMSNorm accumulates in double** for the mean-of-squares — values can
+  be large, and `double` accumulation limits cancellation on long
+  reductions.
+
+### Bugs worth noting
+
+- `Tensor::at_flat()` returns a `float&` even on Int32 storage, which
+  silently miswrites the bytes (only the low 4 bytes get the float value).
+  Added `at_flat_int()` for typed access. Caught by `llama_forward_smoke`
+  failing with "token id out of range" — the value read back was
+  garbage.
+- My first attention test used `seq=2` and `start_pos=0`, but position
+  1 *does* get rotated by RoPE (only position 0 is identity). The test
+  trace assumed identity RoPE for both rows and gave wrong expectations.
+  Split the test into `seq=1` (RoPE identity at pos 0) and a separate
+  `seq=2` test that accounts for the rotation at pos 1.
+
+### What's tested (28 cases across Phase 5)
+
+- RMSNorm: zero, hand-computed, per-channel gamma, 2-D rows, 3-D input,
+  wrong last-dim, non-1-D gamma
+- RoPE: identity at pos 0, hand-computed single-pair rotation, multiple
+  heads, multiple positions, start_pos offset, norm preservation per
+  pair, precomputed tables, odd-dim rejection
+- Attention: identity weights, single-token causal pass-through, seq=2
+  with RoPE, random smoke, bad config rejection
+- MLP: zero intermediate, hand-computed, random smoke
+- Model: block with zero MLP, full forward smoke, zero weights → zero
+  logits, wrong dtype, OOV token
+
+### Numbers
+
+This phase is correctness-focused; the per-head matmul makes each
+forward pass roughly `O(n_layers * n_heads * seq^2 * head_dim)` per
+block, dominated by the softmax materialization. We'll measure in
+Phase 9.
 
 ## License
 
