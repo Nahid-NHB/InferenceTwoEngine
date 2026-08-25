@@ -39,6 +39,17 @@
   #define TINYLLM_HAVE_AVX2 0
 #endif
 
+// AVX-512F + VL + BW detection. We only enable the fused Q4_0 matvec
+// kernel when all four are present (we use vpmovzxbd which needs BW;
+// vpsrld/512-bit ops need F; 256-bit intrinsics we use as aliases need
+// VL). VBMI2 is enabled by the CMake flag but isn't required by the
+// kernel itself.
+#if defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512BW__)
+  #define TINYLLM_HAVE_AVX512 1
+#else
+  #define TINYLLM_HAVE_AVX512 0
+#endif
+
 namespace tinyllm::ops {
 
 namespace {
@@ -48,6 +59,7 @@ namespace {
 // -----------------------------------------------------------------------------
 struct CpuFeatures {
     bool avx2 = false;
+    bool avx512 = false;
     int  hardware_threads = 1;
 
     static const CpuFeatures& get() {
@@ -64,6 +76,12 @@ private:
         // CPUID. For simplicity (and because we only build with -mavx2 when
         // we want it), we just say "AVX2 is present iff compiled with it."
         f.avx2 = true;
+#endif
+#if TINYLLM_HAVE_AVX512
+        // Same story: the runtime checks would be a CPUID walk; for now
+        // we trust the compile-time flag. Real deployments on Skylake-X
+        // and later can flip this with a runtime probe later.
+        f.avx512 = true;
 #endif
         return f;
     }
@@ -460,6 +478,94 @@ void matvec_q4_0_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
 #endif
 }
 
+// =============================================================================
+// AVX-512 fused Q4_0 × F32 matvec (Phase 13)
+//
+// Same algorithm as the AVX2 kernel above, but each Q4_0 block (32 elements)
+// is processed by a single 512-bit vector pair: one _mm512 for the 16 lo
+// nibbles, one for the 16 hi nibbles, then two gathers of x with stride 2
+// (every other float) for the lo/hi halves of the dot product.
+//
+// Per block we issue roughly half as many µops as the AVX2 version:
+//   AVX2:  4 × 256-bit cvtepi16_epi32 + 4 × 256-bit mul + 4 × 256-bit gather
+//          + ~10 shuffle/add ops for hsum across two 256-bit halves.
+//   AVX-512: 2 × 512-bit cvtepu8_epi32 (zero-extend byte→dword, 1 op each)
+//          + 2 × 512-bit gather + 2 × 512-bit mul + 2 × 512-bit mul +
+//          1 × 512-bit hsum (vreduceps). That's ~7 ops total per block.
+//
+// Build: requires AVX-512F (gather), AVX-512VL (128/256-bit aliases used
+// for half-block), AVX-512BW (mask regs as 64-bit), AVX-512VBMI2 (we don't
+// actually need it for the kernel itself but the build flag includes it
+// for parity with the CMake check). We gate on TINYLLM_HAVE_AVX512.
+// =============================================================================
+void matvec_q4_0_f32_avx512(const uint8_t* qmat, int64_t M, int64_t K,
+                            const float* x, float* y) {
+#if TINYLLM_HAVE_AVX512
+    if (K % kQ4_0BlockSize != 0) {
+        throw std::runtime_error("matvec_q4_0_f32_avx512: K must be divisible by 32");
+    }
+    int64_t nblocks = K / kQ4_0BlockSize;
+    std::size_t bytes_per_row = static_cast<std::size_t>(nblocks * kQ4_0BlockBytes);
+
+    for (int64_t m = 0; m < M; ++m) {
+        const uint8_t* row = qmat + m * bytes_per_row;
+        float sum = 0.0f;
+        for (int64_t bi = 0; bi < nblocks; ++bi) {
+            const uint8_t* bp = row + bi * kQ4_0BlockBytes;
+            uint16_t sh;
+            std::memcpy(&sh, bp, sizeof(sh));
+            const float scale = quantize_f16_to_f32(sh);
+            const float* xb = x + bi * 32;
+
+            // Load 16 packed bytes; each byte = (hi nibble << 4) | lo nibble.
+            // We use a 128-bit load and rely on the implicit zero-extension
+            // to a 512-bit register — only the low 16 bytes matter.
+            const __m128i bytes128 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(bp + 2));
+            const __m512i bytes = _mm512_zextsi128_si512(bytes128);
+            const __mmask32 mask_nibble = 0x0F0F0F0Fu;
+            const __m512i eight = _mm512_set1_epi32(8);
+
+            // lo_n: 16 bytes → 16 lo nibbles (zero-extend byte→dword).
+            //       AVX-512BW's vpmovzxbd (here _mm512_cvtepu8_epi32) does
+            //       this in one µop.
+            const __m512i lo_n = _mm512_and_si512(bytes, _mm512_set1_epi32(mask_nibble));
+            const __m512i lo32 = _mm512_sub_epi32(
+                _mm512_cvtepu8_epi32(_mm512_castsi512_si128(lo_n)),
+                eight);
+
+            // hi_n: shift right by 4 bits per byte, then mask & widen.
+            const __m512i hi_n = _mm512_and_si512(
+                _mm512_srli_epi16(bytes, 4), _mm512_set1_epi32(mask_nibble));
+            const __m512i hi32 = _mm512_sub_epi32(
+                _mm512_cvtepu8_epi32(_mm512_castsi512_si128(hi_n)),
+                eight);
+
+            // Convert to F32.
+            const __m512 qlo_f = _mm512_cvtepi32_ps(lo32);
+            const __m512 qhi_f = _mm512_cvtepi32_ps(hi32);
+
+            // Gather x with stride 2: lo at even indices, hi at odd indices.
+            const __m512i idx_lo = _mm512_setr_epi32(
+                0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+            const __m512i idx_hi = _mm512_setr_epi32(
+                1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+            const __m512 xv_lo = _mm512_i32gather_ps(idx_lo, xb, 4);
+            const __m512 xv_hi = _mm512_i32gather_ps(idx_hi, xb, 4);
+
+            // Partial dot products and full hsum in one instruction.
+            const __m512 dotv = _mm512_fmadd_ps(qlo_f, xv_lo,
+                            _mm512_mul_ps(qhi_f, xv_hi));
+            sum += _mm512_reduce_add_ps(dotv) * scale;
+        }
+        y[m] = sum;
+    }
+#else
+    (void)qmat; (void)M; (void)K; (void)x; (void)y;
+    throw std::runtime_error("matvec_q4_0_f32_avx512: AVX-512 not available");
+#endif
+}
+
 namespace {
 
 // -----------------------------------------------------------------------------
@@ -485,6 +591,7 @@ MatmulVariant last_picked_variant() noexcept {
 }
 int  hardware_threads() noexcept { return CpuFeatures::get().hardware_threads; }
 bool have_avx2() noexcept { return CpuFeatures::get().avx2; }
+bool have_avx512() noexcept { return CpuFeatures::get().avx512; }
 std::string_view variant_name(MatmulVariant v) noexcept {
     switch (v) {
         case MatmulVariant::Auto:     return "auto";

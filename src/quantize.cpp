@@ -27,12 +27,14 @@
 
 namespace tinyllm {
 
-// Forward declaration for the AVX2 fused Q4_0 path (see matmul.cpp).
-// Defined in tinyllm::ops::matvec_q4_0_f32_avx2; we call it from
-// matmul_q4_0_f32 when AVX2 is enabled.
+// Forward declaration for the AVX2 / AVX-512 fused Q4_0 paths (see
+// matmul.cpp). Defined in tinyllm::ops::matvec_q4_0_f32_avx{2,512}; we
+// call them from matmul_q4_0_f32 when the matching ISA is enabled.
 namespace ops {
 void matvec_q4_0_f32_avx2(const uint8_t* qmat, int64_t M, int64_t K,
                           const float* x, float* y);
+void matvec_q4_0_f32_avx512(const uint8_t* qmat, int64_t M, int64_t K,
+                            const float* x, float* y);
 }
 
 // =============================================================================
@@ -293,7 +295,7 @@ void matmul_q8_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
     }
 }
 
-#if !TINYLLM_ENABLE_AVX2
+#if !TINYLLM_ENABLE_AVX512 && !TINYLLM_ENABLE_AVX2
 void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
                                 const float* x, float* y) {
     if (K % kQ4_0BlockSize != 0) {
@@ -312,7 +314,7 @@ void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
         y[m] = static_cast<float>(acc);
     }
 }
-#endif  // !TINYLLM_ENABLE_AVX2
+#endif  // !TINYLLM_ENABLE_AVX512 && !TINYLLM_ENABLE_AVX2
 
 // (Forward declaration for the AVX2 fused Q4_0 path lives at the top of
 // this file, outside this anonymous namespace.)
@@ -321,7 +323,12 @@ void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
 
 void matmul_q4_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
-#if TINYLLM_ENABLE_AVX2
+#if TINYLLM_ENABLE_AVX512
+    // Phase 13: prefer AVX-512 when the build exposes it. The dispatch is
+    // static (compile-time flag) today; a runtime CPUID probe could split
+    // it later. AVX-512F+VL+BW is the floor.
+    tinyllm::ops::matvec_q4_0_f32_avx512(qmat, M, K, x, y);
+#elif TINYLLM_ENABLE_AVX2
     tinyllm::ops::matvec_q4_0_f32_avx2(qmat, M, K, x, y);
 #else
     matmul_q4_0_f32_reference(qmat, M, K, x, y);

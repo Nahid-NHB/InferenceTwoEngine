@@ -18,6 +18,7 @@
 
 #include "tinyllm/tensor.hpp"
 
+#include <cstdint>
 #include <string_view>
 
 namespace tinyllm::ops {
@@ -47,5 +48,16 @@ std::string_view variant_name(MatmulVariant v) noexcept;
 // the build actually targets.
 int  hardware_threads() noexcept;
 bool have_avx2() noexcept;
+bool have_avx512() noexcept;
+
+// Direct entry points to the fused Q4_0 × F32 kernels. Useful for the
+// benchmarking suite to put a number on the AVX2 vs AVX-512 gap. The
+// static dispatch in `matmul_q4_0_f32` (quantize.cpp) is the path the
+// engine actually uses; these are direct.
+// Both functions throw std::runtime_error if their ISA isn't compiled in.
+void matvec_q4_0_f32_avx2(const std::uint8_t* qmat, std::int64_t M,
+                          std::int64_t K, const float* x, float* y);
+void matvec_q4_0_f32_avx512(const std::uint8_t* qmat, std::int64_t M,
+                            std::int64_t K, const float* x, float* y);
 
 }  // namespace tinyllm::ops

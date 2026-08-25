@@ -6,7 +6,8 @@
 //   - generate random weights (M*K floats) and a random input vector (K)
 //   - pack the weights to Q4_0 / Q8_0
 //   - time: F32 matmul (one row at a time, single-precision reference),
-//           Q4_0×F32 matvec (AVX2 fused if available, else reference),
+//           Q4_0×F32 matvec (AVX-512 fused if available, else AVX2
+//           fused, else reference),
 //           Q8_0×F32 matvec (currently the dequant-then-FMA reference).
 //
 // The Q4_0 numbers demonstrate the benefit of fusing dequant with the dot
@@ -27,6 +28,10 @@ using namespace tinyllm;
 using clk = std::chrono::high_resolution_clock;
 
 int main() {
+    std::printf("# build: AVX2=%d AVX-512=%d threads=%d\n",
+                ops::have_avx2() ? 1 : 0,
+                ops::have_avx512() ? 1 : 0,
+                ops::hardware_threads());
     struct Shape { int64_t M, K; };
     std::vector<Shape> shapes = {
         {128, 256},
@@ -72,6 +77,33 @@ int main() {
         double q4_ms = std::chrono::duration<double, std::milli>(tq1 - tq0).count();
         std::printf("Q4_0,%ld,%ld,%.3f,%.3f,%.2fx\n",
                     M, K, f32_ms, q4_ms, f32_ms / q4_ms);
+
+        // ---- Q4_0 AVX-512 vs AVX2 head-to-head.
+        // When both ISAs are compiled in, the static dispatch picks the
+        // best one (AVX-512). Call the AVX2 kernel directly here to put
+        // a number on the AVX-512 speedup over AVX2.
+#if TINYLLM_ENABLE_AVX2
+        std::vector<float> y_q4_avx2(static_cast<std::size_t>(M));
+        // Warmup
+        ops::matvec_q4_0_f32_avx2(packed_q4.data(), M, K, x.data(), y_q4_avx2.data());
+        auto ta0 = clk::now();
+        ops::matvec_q4_0_f32_avx2(packed_q4.data(), M, K, x.data(), y_q4_avx2.data());
+        auto ta1 = clk::now();
+        double q4_avx2_ms = std::chrono::duration<double, std::milli>(ta1 - ta0).count();
+        std::printf("Q4_0_avx2,%ld,%ld,,%.3f,\n", M, K, q4_avx2_ms);
+#endif
+#if TINYLLM_ENABLE_AVX512
+        std::vector<float> y_q4_avx512(static_cast<std::size_t>(M));
+        // Warmup
+        ops::matvec_q4_0_f32_avx512(packed_q4.data(), M, K, x.data(), y_q4_avx512.data());
+        auto t512_0 = clk::now();
+        ops::matvec_q4_0_f32_avx512(packed_q4.data(), M, K, x.data(), y_q4_avx512.data());
+        auto t512_1 = clk::now();
+        double q4_avx512_ms = std::chrono::duration<double, std::milli>(t512_1 - t512_0).count();
+        std::printf("Q4_0_avx512,%ld,%ld,,%.3f,\n", M, K, q4_avx512_ms);
+        std::printf("# speedup avx512 vs avx2: %.2fx at (%ld,%ld)\n",
+                    q4_avx2_ms / q4_avx512_ms, M, K);
+#endif
 
         // ---- Q8_0
         auto packed_q8 = quantize_q8_0(w.data(), M * K);

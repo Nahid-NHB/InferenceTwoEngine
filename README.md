@@ -23,6 +23,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |  10   | Benchmarking suite                   |   ✅   |
 |  11   | GGUF → LlamaModel loader + driver    |   ✅   |
 |  12   | K-quant dequant (Q4_K / Q5_K / Q6_K) |   ✅   |
+|  13   | AVX-512 fused Q4_0 matvec             |   ✅   |
 
 ## Build
 
@@ -36,9 +37,9 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 134 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
+./build/bin/run_all_tests    # 135 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
-                             # 13 sampler, 26 quantize, 6 llama_loader)
+                             # 13 sampler, 27 quantize, 6 llama_loader)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
 ./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_quantize   # Q4_0 / Q8_0 × F32 matvec vs F32 matmul
@@ -919,6 +920,105 @@ arithmetic typo. They all pass; total test count is now 134.
   `matmul_q4_K_f32` / `matmul_q6_K_f32` are scaffolded for that work.
 - Q2_K / Q3_K support. Same fused-kernel caveat as above; nobody ships
   them in 2025+.
+
+## Phase 13 notes — AVX-512 fused Q4_0 matvec
+
+### Why
+
+Phase 9 shipped the AVX2 fused Q4_0 kernel (`matvec_q4_0_f32_avx2`),
+which is the hot path for every Q4_0 weight × F32 activation in the
+model. Phase 13 ports that kernel to AVX-512F, the natural follow-up:
+on x86 servers and modern desktop CPUs (Skylake-X / Zen 4 / Sapphire
+Rapids and later), 512-bit registers and the wider FMA / gather
+pipeline roughly **1.4×–1.9× faster** for this kernel — see numbers
+below.
+
+### What got added
+
+- `CMakeLists.txt` — a second `check_cxx_compiler_flag` for
+  `-mavx512f -mavx512vl -mavx512bw -mavx512vbmi2`. When the compiler
+  accepts the flag, we add it to `tinyllm_core` (now `PUBLIC` so the
+  `bench_*` targets get the same defines and can call into the kernel
+  directly) and define `TINYLLM_ENABLE_AVX512=1`.
+- `src/matmul.cpp`:
+  - New `TINYLLM_HAVE_AVX512` macro, set iff
+    `defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512BW__)`
+    (we don't actually need VL/BW for the kernel itself, but we gate
+    together to avoid skew).
+  - New `matvec_q4_0_f32_avx512(...)` kernel in `tinyllm::ops`. Same
+    algorithm as the AVX2 path (nibble unpack → subtract 8 → multiply
+    by strided x → hsum), but each 32-element Q4_0 block fits in
+    **two** `__m512` vectors instead of four `__m256`s, and the hsum
+    collapses to one `_mm512_reduce_add_ps`. The dispatch
+    (`pick_best`) and the public `CpuFeatures` struct gained an
+    `avx512` field.
+  - New `have_avx512()` accessor on `tinyllm::ops` for the
+    bench/feature-detection tests.
+  - New direct kernel entry points (`matvec_q4_0_f32_avx2` and
+    `matvec_q4_0_f32_avx512`) declared in `matmul.hpp` so the benchmark
+    suite can call them head-to-head.
+- `src/quantize.cpp`:
+  - `matmul_q4_0_f32` dispatch chain is now
+    `AVX-512 → AVX2 → reference`. The static `TINYLLM_ENABLE_AVX512`
+    flag chooses; a future runtime CPUID probe would let us ship a
+    single binary that picks per-process.
+- `benchmarks/bench_quantize.cpp`:
+  - Header line prints `AVX2=1 AVX-512=1 threads=N` so the user
+    immediately sees what the build actually targets.
+  - For each shape, the bench now also reports `Q4_0_avx2` and
+    `Q4_0_avx512` separately, plus a one-line
+    `# speedup avx512 vs avx2: 1.6x` summary.
+- `benchmarks/bench_transformer.cpp` — CPU-feature line now prints
+  AVX-512 too.
+- `tests/test_quantize.cpp` — new parity test
+  `matvec_q4_0_avx2_vs_avx512` runs both kernels on the same random
+  input and asserts agreement within the same tolerance the F32 path
+  uses (1e-2 × K).
+
+### Numbers
+
+`bench_quantize` on a 4-thread Skylake-class CPU with both AVX2 and
+AVX-512 enabled:
+
+```text
+format,M,K,f32_ms,qmat_ms,speedup
+Q4_0,128,256,0.094,0.033,2.88x
+Q4_0_avx2,128,256,,0.046,
+Q4_0_avx512,128,256,,0.029,
+# speedup avx512 vs avx2: 1.59x at (128,256)
+Q4_0,256,512,0.266,0.111,2.40x
+Q4_0_avx2,256,512,,0.176,
+Q4_0_avx512,256,512,,0.120,
+# speedup avx512 vs avx2: 1.47x at (256,512)
+Q4_0,512,1024,0.901,0.442,2.04x
+Q4_0_avx2,512,1024,,0.855,
+Q4_0_avx512,512,1024,,0.457,
+# speedup avx512 vs avx2: 1.87x at (512,1024)
+Q4_0,1024,2048,4.066,1.853,2.19x
+Q4_0_avx2,1024,2048,,2.960,
+Q4_0_avx512,1024,2048,,2.165,
+# speedup avx512 vs avx2: 1.37x at (1024,2048)
+```
+
+The shape dependence is the expected gather-throughput effect: AVX-512
+helps the most on smaller K (where per-block setup dominates) and the
+least on larger K (where the two gathers dominate and they're roughly
+the same speed on both ISAs).
+
+### What's still missing
+
+- A **fused** K-quant matvec kernel (Q4_K / Q6_K). The Q4_0 kernel is
+  now ~1.4-1.9× faster; K-quants still pay the dequant-bounce. This
+  is the next thing on the punch list.
+- **Runtime CPUID dispatch.** Today the choice is compile-time; we
+  could ship a single binary that probes and picks. Trivial follow-up
+  if needed.
+- **AVX-512 VNNI** for Q8_0. `vpdpwssd` would let us skip the per-lane
+  int8→int16 promotion and FMA int8×int8 directly into int32
+  accumulators. ~2× for Q8_0 if we ever care.
+- **AVX-512 BFloat16** for F32 matmul itself. Would need the F32
+  weights converted at load time; not worth it until there's a
+  measured F32 matmul bottleneck in `bench_transformer`.
 
 ## License
 

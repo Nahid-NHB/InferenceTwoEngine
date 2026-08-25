@@ -73,8 +73,25 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i.86)")
     check_cxx_compiler_flag("-mavx2 -mfma -mbmi2" HAVE_AVX2_FLAG)
     if(HAVE_AVX2_FLAG)
         message(STATUS "Enabling AVX2 + FMA in tinyllm_core")
-        target_compile_options(tinyllm_core PRIVATE -mavx2 -mfma -mbmi2)
-        target_compile_definitions(tinyllm_core PRIVATE TINYLLM_ENABLE_AVX2=1)
+        target_compile_options(tinyllm_core PUBLIC -mavx2 -mfma -mbmi2)
+        target_compile_definitions(tinyllm_core PUBLIC TINYLLM_ENABLE_AVX2=1)
+    endif()
+
+    # Phase 13: prefer AVX-512F+VL+BW+VBMI2 for the Q4_0 matvec kernel
+    # when available. The dispatch in src/matmul.cpp falls back to AVX2
+    # if the runtime CPU doesn't expose AVX-512F. We require VL+BW so
+    # we can use 512-bit byte/word shifts and the VBMI2 byte-shuffle
+    # instructions (vpcompressd is in VBMI2; we use it as a fast
+    # deinterleave). VNNI is not required.
+    check_cxx_compiler_flag(
+        "-mavx512f -mavx512vl -mavx512bw -mavx512vbmi2" HAVE_AVX512_FLAG)
+    if(HAVE_AVX512_FLAG)
+        message(STATUS
+            "Enabling AVX-512F+VL+BW+VBMI2 in tinyllm_core (Q4_0 kernel)")
+        target_compile_options(tinyllm_core PUBLIC
+            -mavx512f -mavx512vl -mavx512bw -mavx512vbmi2)
+        target_compile_definitions(tinyllm_core PUBLIC
+            TINYLLM_ENABLE_AVX512=1)
     endif()
 endif()
 

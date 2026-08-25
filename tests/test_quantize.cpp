@@ -276,6 +276,32 @@ TEST_CASE(matmul_q4_0_larger) {
     }
 }
 
+#if TINYLLM_ENABLE_AVX2 && TINYLLM_ENABLE_AVX512
+// Phase 13: AVX-512 fused Q4_0 kernel must agree with the AVX2 kernel
+// on the same input. The two kernels have different reduction trees
+// (AVX2: 4 vectors with separate mul + 4-way add; AVX-512: 1 FMA + 1
+// mul + add per lo/hi pair, but a wider hsum). That means fp rounding
+// can diverge by a few ULPs; the absolute tolerance below is the same
+// as the AVX2-vs-F32 tolerance used elsewhere in this file.
+TEST_CASE(matvec_q4_0_avx2_vs_avx512) {
+    const int64_t M = 16, K = 512;
+    auto a = random_floats(static_cast<std::size_t>(M * K), /*seed=*/31);
+    auto x = random_floats(static_cast<std::size_t>(K),     /*seed=*/32);
+    auto packed = quantize_q4_0(a.data(), M * K);
+
+    std::vector<float> y_avx2(static_cast<std::size_t>(M));
+    std::vector<float> y_avx512(static_cast<std::size_t>(M));
+    ops::matvec_q4_0_f32_avx2(packed.data(), M, K, x.data(), y_avx2.data());
+    ops::matvec_q4_0_f32_avx512(packed.data(), M, K, x.data(), y_avx512.data());
+
+    for (int64_t mi = 0; mi < M; ++mi) {
+        REQUIRE_NEAR(y_avx2[static_cast<std::size_t>(mi)],
+                     y_avx512[static_cast<std::size_t>(mi)],
+                     /*tol=*/1e-2f * static_cast<float>(K));
+    }
+}
+#endif  // TINYLLM_ENABLE_AVX2 && TINYLLM_ENABLE_AVX512
+
 // -----------------------------------------------------------------------------
 // GGUF round-trip: write a synthetic GGUF v3 file with a Q8_0 and a Q4_0
 // tensor, read it back via GgufFile::load_tensor, and confirm the

@@ -22,7 +22,8 @@
 //   Attention:            attention_forward (prefill) + cached decode
 //   MLP:                  mlp_forward (SwiGLU)
 //   Llama block:          llama_block_forward + cached
-//   Quantized matvec:     matmul_q4_0_f32 (AVX2 fused)
+//   Quantized matvec:     matmul_q4_0_f32 (AVX-512 fused if available,
+//                        else AVX2 fused, else reference)
 //   End-to-end:           llama_forward / cached
 //
 // Output is human-readable text tables + a CSV block at the bottom for
@@ -439,8 +440,9 @@ int main(int argc, char** argv) {
     ModelCfg big    {"big",    2048, 5504, 16, 128, 16, 2, 4096};
 
     std::printf("Phase 10 unified benchmark suite (iters=%d)\n", iters);
-    std::printf("Auto-detected CPU: AVX2=%s, threads=%d\n",
+    std::printf("Auto-detected CPU: AVX2=%s, AVX-512=%s, threads=%d\n",
                 ops::have_avx2() ? "yes" : "no",
+                ops::have_avx512() ? "yes" : "no",
                 ops::hardware_threads());
 
     std::vector<BenchResult> rows;
@@ -465,7 +467,7 @@ int main(int argc, char** argv) {
     {
         std::vector<BenchResult> t;
         bench_quantize_matvec(t, rng, iters);
-        print_table(t, "Quantized matvec (Q4_0 x F32, AVX2 fused)");
+        print_table(t, "Quantized matvec (Q4_0 x F32, AVX-512 fused if available, else AVX2)");
         rows.insert(rows.end(), t.begin(), t.end());
     }
 
