@@ -21,6 +21,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   8   | Quantization (Q8_0 + Q4_0)          |   ✅   |
 |   9   | Performance engineering (AVX2/512)   |   ✅   |
 |  10   | Benchmarking suite                   |   ✅   |
+|  11   | GGUF → LlamaModel loader + driver    |   ✅   |
 
 ## Build
 
@@ -34,9 +35,9 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 117 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf,
+./build/bin/run_all_tests    # 124 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
-                             # 13 sampler, 15 quantize)
+                             # 13 sampler, 15 quantize, 6 llama_loader)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
 ./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_quantize   # Q4_0 / Q8_0 × F32 matvec vs F32 matmul
@@ -46,7 +47,39 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ./build/bin/tinyllm         # CLI smoke test
 ./build/bin/generate_demo   # end-to-end inference with random-init Llama
                             # (greedy + top-k + top-p + sampling + Q4_0 demo)
+./build/bin/gguf_driver     # load a real Llama-family GGUF and run generate
+                            # (token-IDs in, token-IDs out; no tokenizer shim)
 ```
+
+## Load a real model
+
+`examples/gguf_driver.cpp` is the closest thing we ship to "actually run a
+real LLM". It loads any Llama-family GGUF v3 file (TinyLlama, Qwen2,
+Llama-2, etc.), materializes the weights as F32 (Q4_0/Q8_0/F16 are
+dequantized on the fly by `GgufFile::load_tensor`), and runs
+`generate(...)` over a prompt.
+
+```bash
+# Pick the prompt token IDs with whatever tokenizer produced the GGUF,
+# then feed them in:
+./build/bin/gguf_driver \
+    --gguf tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
+    --prompt 1,2,3,4,5 \
+    --max-new 32 \
+    --temperature 0.8 \
+    --top-p 0.95 \
+    --seed 42
+```
+
+The CLI prints token IDs (decimal and hex) and a `tok/s` number. There
+is no built-in tokenizer shim — convert text → ids with the tokenizer
+that produced the model, and ids → text with the same. This is the
+deliberate boundary: tokenization is a per-model problem and the engine
+itself shouldn't care.
+
+If the estimated F32 weight memory exceeds 4 GiB, the loader prints a
+soft warning before proceeding — handy when you accidentally point it
+at a 7B Q4_0 and were about to materialize ~28 GiB of float32.
 
 ## Layout
 
@@ -58,7 +91,8 @@ tinyllm/
 │   ├── tensor.hpp       # Tensor + ops + broadcasting + views
 │   ├── matmul.hpp       # matmul variants + MatmulVariant enum
 │   ├── tokenizer.hpp    # BPE tokenizer
-│   └── gguf.hpp         # GGUF file parser
+│   ├── gguf.hpp         # GGUF file parser
+│   └── llama_loader.hpp # GGUF → LlamaModelWeights
 ├── src/
 │   ├── memory.cpp
 │   ├── tensor.cpp
@@ -663,6 +697,118 @@ compiler flags.
 `ops::hardware_threads()` and `ops::have_avx2()` were promoted from
 `matmul.cpp`'s anonymous namespace to the public header so the bench
 suite can report what it actually targeted.
+
+## Phase 11 notes — GGUF → LlamaModel loader
+
+### What it does
+
+`include/tinyllm/llama_loader.hpp` + `src/llama_loader.cpp` close the
+last functional gap: the GGUF parser could *read* a Llama checkpoint,
+but nothing turned a parsed GGUF into a runnable `LlamaModel`. The
+loader does exactly that — read the metadata KVs, walk `tensor_infos()`
+by name, dequantize each named weight to F32 (the existing
+`GgufFile::load_tensor` already does the Q4_0/Q8_0/F16 → F32 work),
+and populate a `LlamaModelWeights` ready for `make_model`.
+
+### Public surface
+
+```cpp
+struct LlamaLoadResult { LlamaConfig cfg; LlamaModelWeights weights; };
+std::optional<LlamaLoadResult> load_llama_from_gguf(
+    const std::string& path, std::ostream& diag);
+std::size_t estimate_llama_f32_bytes(const GgufFile& gf);
+```
+
+Errors are `std::optional`-shaped: `nullopt` means the file could not
+be opened, a required KV was missing or had the wrong type, or a
+required tensor was missing. The diagnostic stream receives one line
+per issue so the user can fix their GGUF.
+
+### Naming conventions
+
+The loader recognizes the standard llama.cpp / ggml convention used by
+basically every Llama-family quantizer:
+
+```text
+token_embd.weight         → W_embed[vocab, hidden]
+output.weight             → W_output[hidden, vocab]   (skipped if absent)
+output_norm.weight        → final_norm[hidden]
+blk.{i}.attn_norm.weight  → blocks[i].attn_norm
+blk.{i}.attn_q.weight     → blocks[i].attn.Wq
+blk.{i}.attn_k.weight     → blocks[i].attn.Wk
+blk.{i}.attn_v.weight     → blocks[i].attn.Wv
+blk.{i}.attn_output.weight→ blocks[i].attn.Wo
+blk.{i}.ffn_norm.weight   → blocks[i].mlp_norm
+blk.{i}.ffn_gate.weight   → blocks[i].mlp.W_gate
+blk.{i}.ffn_up.weight     → blocks[i].mlp.W_up
+blk.{i}.ffn_down.weight   → blocks[i].mlp.W_down
+```
+
+`LlamaConfig` is built from `llama.vocab_size`, `llama.embedding_length`,
+`llama.feed_forward_length`, `llama.attention.head_count`,
+`llama.attention.head_count_kv`, `llama.block_count`, `llama.context_length`,
+`llama.attention.layer_norm_rms_epsilon` (optional),
+`llama.rope.freq_base` (optional). `head_dim` is derived as
+`hidden / n_heads`.
+
+### Tied embeddings
+
+Real Llama 2/3 checkpoints don't include `output.weight` — they tie it
+to `W_embed` transposed. When `output.weight` is absent the loader
+emits a diagnostic and copies a transposed view of `W_embed` into
+`W_output`. Llama-2-7B-instruct ships this way; TinyLlama does not.
+
+### Memory soft-warning
+
+Every named tensor's on-disk byte size is summed and multiplied by 4
+(the worst-case F32 inflation ratio: Q4_0 is ~7× but with the
+embeddings/head counted at full size the *average* multiplier is
+smaller — we use 4× as a rough upper bound). If that exceeds
+`kLlamaLoadSoftWarnBytes` (4 GiB by default), the loader prints a
+warning to the diagnostic stream and **proceeds anyway**. This is the
+deliberate hard-fail boundary: loading a Q4_0 7B will materialize
+~28 GiB of float32, and the user should see that before it happens.
+
+### `gguf_driver`
+
+`examples/gguf_driver.cpp` wires the loader to `generate(...)` and
+prints the output as token IDs:
+
+```bash
+./build/bin/gguf_driver --gguf model.gguf --prompt 1,2,3 --max-new 16
+```
+
+The driver prints the loaded `LlamaConfig`, the estimated F32
+footprint, the prompt and generated token sequences (decimal and hex),
+and a `tok/s` number. Greedy runs are checked for determinism: the
+generator is invoked twice with the same seed and the outputs are
+compared. Token-IDs-only is a deliberate scope choice — a tokenizer
+shim is per-model-family and out of scope for the engine itself.
+
+### Tests
+
+`tests/test_llama_loader.cpp` adds 6 tests:
+
+- `loader_populates_config` — every LlamaConfig field round-trips.
+- `loader_finds_every_named_tensor` — every required slot is filled
+  with the right shape.
+- `loader_fails_cleanly_on_missing_tensor` — when the file omits
+  required tensors, the loader returns nullopt and names what's
+  missing.
+- `loader_round_trips_a_real_shape_model` — the loaded weights, fed
+  through `make_model` + a forward pass, produce logits byte-equal
+  (within 1e-5) to a hand-built reference model built from the same
+  tensors.
+- `loader_estimates_f32_memory` — `estimate_llama_f32_bytes` agrees
+  with the expected sum and is well below the soft-warn threshold for
+  the synthetic file.
+- `loader_handles_tied_embeddings` — a file with no `output.weight`
+  yields a populated `W_output` (transposed from `W_embed`) and the
+  diagnostic mentions "tying W_output".
+
+The synthetic file fixture is also dumped to
+`/tmp/tinyllm_test_loader.gguf` by the last test, so the driver can be
+smoke-tested without a real Llama checkpoint on hand.
 
 ## License
 

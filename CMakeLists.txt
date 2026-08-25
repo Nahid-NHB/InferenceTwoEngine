@@ -60,6 +60,7 @@ add_library(tinyllm_core
     src/kv_cache.cpp
     src/sampler.cpp
     src/quantize.cpp
+    src/llama_loader.cpp
 )
 target_include_directories(tinyllm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

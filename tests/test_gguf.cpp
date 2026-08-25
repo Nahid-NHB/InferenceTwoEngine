@@ -64,6 +64,18 @@ public:
         le<uint64_t>(arr.size());
         for (uint32_t v : arr) le<uint32_t>(v);
     }
+    void value_array_string(const std::vector<std::string>& arr) {
+        le<uint32_t>(static_cast<uint32_t>(GgufValueType::Array));
+        le<uint32_t>(static_cast<uint32_t>(GgufValueType::String));
+        le<uint64_t>(arr.size());
+        for (const auto& s : arr) str(s);
+    }
+    void value_array_float32(const std::vector<float>& arr) {
+        le<uint32_t>(static_cast<uint32_t>(GgufValueType::Array));
+        le<uint32_t>(static_cast<uint32_t>(GgufValueType::Float32));
+        le<uint64_t>(arr.size());
+        for (float v : arr) le<float>(v);
+    }
 
     void tensor_info(std::string_view name, const std::vector<uint64_t>& dims,
                      GgufTensorType dt, uint64_t offset) {

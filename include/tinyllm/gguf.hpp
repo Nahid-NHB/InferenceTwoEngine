@@ -182,6 +182,11 @@ public:
     // Tensor info (parsed but not loaded).
     const std::vector<GgufTensorInfo>& tensor_infos() const noexcept { return tinfos_; }
 
+    // Lookup helper: returns the index of the tensor whose name matches,
+    // or std::nullopt if no such tensor exists. Linear scan; the tensor
+    // info list is small (a few hundred entries in a typical Llama GGUF).
+    std::optional<std::size_t> find_tensor(const std::string& name) const;
+
     // Load a single tensor by index. Throws if dtype is unsupported or
     // the read would go past the file.
     Tensor load_tensor(std::size_t idx) const;

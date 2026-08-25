@@ -210,6 +210,13 @@ const GgufValue* GgufFile::get_kv(const std::string& key) const {
     return nullptr;
 }
 
+std::optional<std::size_t> GgufFile::find_tensor(const std::string& name) const {
+    for (std::size_t i = 0; i < tinfos_.size(); ++i) {
+        if (tinfos_[i].name == name) return i;
+    }
+    return std::nullopt;
+}
+
 // -----------------------------------------------------------------------------
 // Load a tensor's data
 // -----------------------------------------------------------------------------

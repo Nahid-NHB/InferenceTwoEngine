@@ -8,3 +8,4 @@ endfunction()
 
 tinyllm_add_example(phase1_demo phase1_demo.cpp)
 tinyllm_add_example(generate_demo generate_demo.cpp)
+tinyllm_add_example(gguf_driver gguf_driver.cpp)

@@ -15,6 +15,7 @@ add_library(tinyllm_test_cases OBJECT
     test_kv_cache.cpp
     test_sampler.cpp
     test_quantize.cpp
+    test_llama_loader.cpp
 )
 target_include_directories(tinyllm_test_cases PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
