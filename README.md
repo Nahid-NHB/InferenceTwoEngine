@@ -13,7 +13,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   0   | Project architecture & CMake build   |   ✅   |
 |   1   | Tensor library (Float32/Int32, views)|   ✅   |
 |   2   | Matmul: blocking, SIMD, threading    |   ✅   |
-|   3   | BPE tokenizer                        |   ⏳   |
+|   3   | BPE tokenizer                        |   ✅   |
 |   4   | GGUF model loader                    |   ⏳   |
 |   5   | Llama-style transformer              |   ⏳   |
 |   6   | KV cache                             |   ⏳   |
@@ -148,6 +148,52 @@ existing C into the accumulators at the start of each `kk` block, FMA in
 this block's contribution, then store back. That bug was caught by the
 `variants_agree_large` test in ~3 seconds — writing the test first paid
 off.
+
+## Phase 3 notes — BPE tokenizer
+
+### Algorithm
+
+1. UTF-8 encode the input into bytes.
+2. Convert each byte to its display string (single character).
+3. Repeatedly find the adjacent pair with the **lowest merge rank** and
+   merge it (concatenate the strings).
+4. Stop when no adjacent pair appears in the merge table.
+5. Look each resulting string up in the vocab to get a token id.
+
+Decoding inverts this: byte tokens emit their single byte directly; other
+tokens emit their (UTF-8) display string.
+
+### On-disk format
+
+We accept two simple file types:
+
+- `vocab.json` — JSON array of strings, index in array == token id. First
+  256 entries must be the byte tokens (`"<0x00>"`, ..., `"<0xFF>"`).
+- `merges.txt` — one merge per line, `"A B"`, in priority order. `#` for
+  comments; blank lines ignored.
+
+This format is intentionally trivial to generate from a real
+HuggingFace/SentencePiece tokenizer (a 30-line Python script does it; one
+will be added under `examples/` later).
+
+### What's tested (13 cases)
+
+- Byte-token validation at load time (rejects malformed vocabs)
+- Pure-ASCII encode, no merges apply
+- Single merge ("hi" from "h"+"i")
+- Chain of merges ("his")
+- Merge priority (lower rank wins when both apply)
+- ASCII round-trip
+- UTF-8 round-trip (café, résumé, naïve — multi-byte UTF-8 preserved)
+- BOS/EOS handling
+- `token_to_id` / `id_to_token` lookups
+- Unknown merged token falls back to `<unk>`
+
+### Numbers
+
+On the toy vocab (~10 kB text, 264 tokens, 2 merges): ~1.77 MB/s encode
+speed. A real LLaMA tokenizer (~32 k vocab, ~30 k merges) will be slower
+per pair but the loop is still O(n).
 
 ## License
 
