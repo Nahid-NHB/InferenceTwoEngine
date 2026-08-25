@@ -14,7 +14,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |   1   | Tensor library (Float32/Int32, views)|   ✅   |
 |   2   | Matmul: blocking, SIMD, threading    |   ✅   |
 |   3   | BPE tokenizer                        |   ✅   |
-|   4   | GGUF model loader                    |   ⏳   |
+|   4   | GGUF model loader                    |   ✅   |
 |   5   | Llama-style transformer              |   ⏳   |
 |   6   | KV cache                             |   ⏳   |
 |   7   | Sampling (greedy / top-k / top-p)    |   ⏳   |
@@ -34,9 +34,10 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests   # 30 unit tests (23 tensor + 7 matmul)
+./build/bin/run_all_tests   # 54 unit tests (23 tensor, 7 matmul, 13 tokenizer, 11 gguf)
 ./build/bin/bench_tensor    # naive matmul baseline numbers
 ./build/bin/bench_matmul    # naive / blocked / AVX2 / threaded comparison
+./build/bin/bench_tokenizer # BPE encode throughput
 ./build/bin/phase1_demo     # 2-layer MLP smoke test
 ./build/bin/tinyllm         # CLI smoke test
 ```
@@ -49,20 +50,27 @@ tinyllm/
 ├── include/tinyllm/
 │   ├── memory.hpp       # ref-counted aligned storage
 │   ├── tensor.hpp       # Tensor + ops + broadcasting + views
-│   └── matmul.hpp       # matmul variants + MatmulVariant enum
+│   ├── matmul.hpp       # matmul variants + MatmulVariant enum
+│   ├── tokenizer.hpp    # BPE tokenizer
+│   └── gguf.hpp         # GGUF file parser
 ├── src/
 │   ├── memory.cpp
 │   ├── tensor.cpp
 │   ├── matmul.cpp       # naive / blocked / AVX2 / threaded
+│   ├── tokenizer.cpp
+│   ├── gguf.cpp
 │   └── main.cpp         # CLI smoke test
 ├── tests/
 │   ├── test_helpers.hpp # minimal REQUIRE/REQUIRE_NEAR harness
 │   ├── test_tensor.cpp
-│   ├── test_matmul.cpp  # cross-variant correctness
+│   ├── test_matmul.cpp
+│   ├── test_tokenizer.cpp
+│   ├── test_gguf.cpp    # round-trip via synthetic writer
 │   └── test_main.cpp
 └── benchmarks/
     ├── bench_tensor.cpp
-    └── bench_matmul.cpp # all 4 variants at N ∈ {64…1024}
+    ├── bench_matmul.cpp
+    └── bench_tokenizer.cpp
 ```
 
 ## Phase 1 notes — tensor library
@@ -194,6 +202,52 @@ will be added under `examples/` later).
 On the toy vocab (~10 kB text, 264 tokens, 2 merges): ~1.77 MB/s encode
 speed. A real LLaMA tokenizer (~32 k vocab, ~30 k merges) will be slower
 per pair but the loop is still O(n).
+
+## Phase 4 notes — GGUF model loader
+
+### What we parse
+
+`GgufFile::open(path)` reads a GGUF v3 file (v2 also tolerated) and
+exposes:
+
+- The metadata KV pairs (architecture name, hyper-params, tokenizer
+  type, etc.).
+- A `GgufTensorInfo` per tensor (name, shape, GGUF dtype, offset into
+  the data section).
+- `load_tensor(idx)` materializes a tensor's data into our `Tensor`
+  type. F32 is copied verbatim; F16 is expanded to F32 since our op
+  kernels only handle Float32 right now. Quantized types (Q4_0, Q4_1,
+  Q8_0) parse and report but raise on load — Phase 8 will wire those
+  up.
+
+### File layout recap
+
+```text
+[ magic "GGUF" ][ version u32 ][ n_tensors u64 ][ n_kv u64 ]
+[ ... n_kv KV pairs ... ]
+[ ... n_tensors tensor infos ... ]
+[ alignment u64 (v3) ]
+[ padding to alignment ]
+[ ... tensor data, each at its alignment-multiple offset ... ]
+```
+
+### Bug worth noting
+
+The first cut treated `data_section_offset_` as "right after the
+alignment field", but the field is followed by padding bytes so the
+first tensor's data starts at the next alignment multiple. The fix
+rounds the offset up. Caught by the `gguf_loads_f32_*` tests — they
+loaded zeros because the reader's seek was 8..24 bytes short.
+
+### What's tested (11 cases)
+
+- Header parse (version, n_tensors, n_kv)
+- Scalar metadata: string, uint32
+- Tensor infos (names, dims, dtype)
+- Tensor loads: F32 matrix, F32 vector, F32 scalar, F16 round-trip
+- Bad magic rejected
+- Unsupported version rejected
+- Dtype name lookups
 
 ## License
 
