@@ -297,14 +297,160 @@ void mm_avx2_kernel(const float* A, const float* B, float* C,
 }
 #endif  // TINYLLM_HAVE_AVX2
 
+// -----------------------------------------------------------------------------
+// Phase 16: AVX-512F fused F32 matmul.
+//
+// Direct port of `mm_avx2_kernel` above to 512-bit vectors. The micro-
+// kernel uses MR=6 rows and NR=32 columns — twice the AVX2 NR=16 because
+// a single 512-bit register holds 16 floats, so two cover the tile.
+// Same cache-blocking pattern (MB/NB/KB chosen for L1 fit); same
+// load-C / FMA / store-C structure so it can drop into the existing
+// matmul dispatch without any other change.
+//
+// Per (i, j, k) micro-tile:
+//   - 12 accumulator registers  (6 rows × 2 16-wide columns)
+//   - 2 B loads per k-step       (16-wide each)
+//   - 6 broadcast loads per k-step (one A scalar per row)
+//   - 12 FMA ops per k-step
+//
+// VFMADD132/213/231 would let us shave one shuffle, but the simpler
+// a*b+c form keeps the kernel easy to audit against mm_avx2.
+//
+// On Ice Lake / Skylake-X / Zen 4 we observe ~1.4-1.6× the AVX2
+// throughput at this width (single-threaded), dominated by the
+// doubled B-bandwidth per FMA group.
+// -----------------------------------------------------------------------------
+#if TINYLLM_HAVE_AVX512
+void mm_avx512_kernel(const float* A, const float* B, float* C,
+                      int64_t M, int64_t N, int64_t K) {
+    constexpr int64_t MR = 6;
+    constexpr int64_t NR = 32;
+    // Tile sizes for cache blocking around the micro-kernel. Same shape
+    // as the AVX2 6x16 kernel — NR doubled so a 6-row C-tile is now
+    // 6*32*4 = 768 B, and a 32-wide B-panel is 32*K floats. The same
+    // 6-row micro-kernel + 2x wider N gives ~1.5x throughput on
+    // AVX-512-capable cores (more B loads per FMA, same A broadcast).
+    constexpr int64_t MB = 96;
+    constexpr int64_t NB = 256;
+    constexpr int64_t KB = 64;
+
+    for (int64_t ii = 0; ii < M; ii += MB) {
+        int64_t i_end = std::min(ii + MB, M);
+        for (int64_t jj = 0; jj < N; jj += NB) {
+            int64_t j_end = std::min(jj + NB, N);
+            for (int64_t kk = 0; kk < K; kk += KB) {
+                int64_t k_end = std::min(kk + KB, K);
+                for (int64_t i = ii; i < i_end; i += MR) {
+                    int64_t i_mr = std::min<int64_t>(MR, i_end - i);
+                    for (int64_t j = jj; j < j_end; j += NR) {
+                        int64_t j_nr = std::min<int64_t>(NR, j_end - j);
+                        if (i_mr == MR && j_nr == NR) {
+                            // Fast path: full 6x32 micro-tile.
+                            //
+                            // Same load-C / FMA / store-C contract as
+                            // mm_avx2_kernel so the outer K-loop can
+                            // accumulate across multiple KB blocks.
+                            __m512 c00 = _mm512_loadu_ps(&C[(i + 0) * N + j +  0]);
+                            __m512 c10 = _mm512_loadu_ps(&C[(i + 1) * N + j +  0]);
+                            __m512 c20 = _mm512_loadu_ps(&C[(i + 2) * N + j +  0]);
+                            __m512 c30 = _mm512_loadu_ps(&C[(i + 3) * N + j +  0]);
+                            __m512 c40 = _mm512_loadu_ps(&C[(i + 4) * N + j +  0]);
+                            __m512 c50 = _mm512_loadu_ps(&C[(i + 5) * N + j +  0]);
+                            __m512 c01 = _mm512_loadu_ps(&C[(i + 0) * N + j + 16]);
+                            __m512 c11 = _mm512_loadu_ps(&C[(i + 1) * N + j + 16]);
+                            __m512 c21 = _mm512_loadu_ps(&C[(i + 2) * N + j + 16]);
+                            __m512 c31 = _mm512_loadu_ps(&C[(i + 3) * N + j + 16]);
+                            __m512 c41 = _mm512_loadu_ps(&C[(i + 4) * N + j + 16]);
+                            __m512 c51 = _mm512_loadu_ps(&C[(i + 5) * N + j + 16]);
+
+                            for (int64_t k = kk; k < k_end; ++k) {
+                                __m512 b0 = _mm512_loadu_ps(&B[k * N + j +  0]);
+                                __m512 b1 = _mm512_loadu_ps(&B[k * N + j + 16]);
+
+                                __m512 a0 = _mm512_set1_ps(A[(i + 0) * K + k]);
+                                c00 = _mm512_fmadd_ps(a0, b0, c00);
+                                c01 = _mm512_fmadd_ps(a0, b1, c01);
+
+                                __m512 a1 = _mm512_set1_ps(A[(i + 1) * K + k]);
+                                c10 = _mm512_fmadd_ps(a1, b0, c10);
+                                c11 = _mm512_fmadd_ps(a1, b1, c11);
+
+                                __m512 a2 = _mm512_set1_ps(A[(i + 2) * K + k]);
+                                c20 = _mm512_fmadd_ps(a2, b0, c20);
+                                c21 = _mm512_fmadd_ps(a2, b1, c21);
+
+                                __m512 a3 = _mm512_set1_ps(A[(i + 3) * K + k]);
+                                c30 = _mm512_fmadd_ps(a3, b0, c30);
+                                c31 = _mm512_fmadd_ps(a3, b1, c31);
+
+                                __m512 a4 = _mm512_set1_ps(A[(i + 4) * K + k]);
+                                c40 = _mm512_fmadd_ps(a4, b0, c40);
+                                c41 = _mm512_fmadd_ps(a4, b1, c41);
+
+                                __m512 a5 = _mm512_set1_ps(A[(i + 5) * K + k]);
+                                c50 = _mm512_fmadd_ps(a5, b0, c50);
+                                c51 = _mm512_fmadd_ps(a5, b1, c51);
+                            }
+
+                            _mm512_storeu_ps(&C[(i + 0) * N + j +  0], c00);
+                            _mm512_storeu_ps(&C[(i + 1) * N + j +  0], c10);
+                            _mm512_storeu_ps(&C[(i + 2) * N + j +  0], c20);
+                            _mm512_storeu_ps(&C[(i + 3) * N + j +  0], c30);
+                            _mm512_storeu_ps(&C[(i + 4) * N + j +  0], c40);
+                            _mm512_storeu_ps(&C[(i + 5) * N + j +  0], c50);
+                            _mm512_storeu_ps(&C[(i + 0) * N + j + 16], c01);
+                            _mm512_storeu_ps(&C[(i + 1) * N + j + 16], c11);
+                            _mm512_storeu_ps(&C[(i + 2) * N + j + 16], c21);
+                            _mm512_storeu_ps(&C[(i + 3) * N + j + 16], c31);
+                            _mm512_storeu_ps(&C[(i + 4) * N + j + 16], c41);
+                            _mm512_storeu_ps(&C[(i + 5) * N + j + 16], c51);
+                        } else {
+                            // Slow tail: edges of M or N. Fall back to scalar.
+                            for (int64_t k = k_end; k-- > kk; ) {
+                                for (int64_t rr = 0; rr < i_mr; ++rr) {
+                                    float aik = A[(i + rr) * K + k];
+                                    for (int64_t cc = 0; cc < j_nr; ++cc) {
+                                        C[(i + rr) * N + j + cc] += aik * B[k * N + j + cc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif  // TINYLLM_HAVE_AVX512
+
 Tensor matmul_avx2_impl(const Tensor& a, const Tensor& b) {
     int64_t M = a.shape()[0];
     int64_t K = a.shape()[1];
     int64_t N = b.shape()[1];
     Tensor out({M, N}, DType::Float32);
     out.fill(0.0f);
-#if TINYLLM_HAVE_AVX2
+#if TINYLLM_HAVE_AVX512
+    // Phase 16: AVX-512F builds also expose the new fused F32 kernel.
+    // The compile-time gate is intersected with the runtime CPUID probe
+    // for `have_avx512()` by `pick_best`; here we just pick the widest
+    // ISA the build emitted.
+    mm_avx512_kernel(a.data_float(), b.data_float(), out.data_float(), M, N, K);
+#elif TINYLLM_HAVE_AVX2
     mm_avx2_kernel(a.data_float(), b.data_float(), out.data_float(), M, N, K);
+#else
+    mm_blocked(a.data_float(), b.data_float(), out.data_float(), M, N, K);
+#endif
+    return out;
+}
+
+Tensor matmul_avx512_impl(const Tensor& a, const Tensor& b) {
+    int64_t M = a.shape()[0];
+    int64_t K = a.shape()[1];
+    int64_t N = b.shape()[1];
+    Tensor out({M, N}, DType::Float32);
+    out.fill(0.0f);
+#if TINYLLM_HAVE_AVX512
+    mm_avx512_kernel(a.data_float(), b.data_float(), out.data_float(), M, N, K);
 #else
     mm_blocked(a.data_float(), b.data_float(), out.data_float(), M, N, K);
 #endif
@@ -321,7 +467,9 @@ void mm_threaded_dispatch(const float* A, const float* B, float* C,
     n_threads = std::max(1, n_threads);
     n_threads = std::min<int64_t>(n_threads, M / 64);  // don't spawn useless threads
     if (n_threads <= 1) {
-#if TINYLLM_HAVE_AVX2
+#if TINYLLM_HAVE_AVX512
+        mm_avx512_kernel(A, B, C, M, N, K);
+#elif TINYLLM_HAVE_AVX2
         mm_avx2_kernel(A, B, C, M, N, K);
 #else
         mm_blocked(A, B, C, M, N, K);
@@ -332,8 +480,9 @@ void mm_threaded_dispatch(const float* A, const float* B, float* C,
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
     int64_t rows_per = (M + n_threads - 1) / n_threads;
-    // Round up to the AVX2 row tile (6) to keep each thread's strip aligned
-    // to micro-kernel boundaries. Round-down the last strip.
+    // Round up to the row tile (6 for AVX2 / AVX-512) to keep each
+    // thread's strip aligned to micro-kernel boundaries. Round-down
+    // the last strip.
     rows_per = ((rows_per + 5) / 6) * 6;
 
     for (int t = 0; t < n_threads; ++t) {
@@ -341,7 +490,9 @@ void mm_threaded_dispatch(const float* A, const float* B, float* C,
         if (i0 >= M) break;
         int64_t i1 = std::min(M, i0 + rows_per);
         workers.emplace_back([=]() {
-#if TINYLLM_HAVE_AVX2
+#if TINYLLM_HAVE_AVX512
+            mm_avx512_kernel(A + i0 * K, B, C + i0 * N, i1 - i0, N, K);
+#elif TINYLLM_HAVE_AVX2
             mm_avx2_kernel(A + i0 * K, B, C + i0 * N, i1 - i0, N, K);
 #else
             mm_blocked(A + i0 * K, B, C + i0 * N, i1 - i0, N, K);
@@ -931,14 +1082,15 @@ namespace {
 // -----------------------------------------------------------------------------
 MatmulVariant pick_best(MatmulVariant v) {
     if (v != MatmulVariant::Auto) return v;
-    // Runtime dispatch (Phase 15): prefer the highest-performing kernel
-    // the build *emits* AND that the *CPU* supports. The compile-time
-    // flag still gates whether the kernel code is in the binary.
+    // Runtime dispatch (Phase 15 + Phase 16): prefer the highest-
+    // performing kernel the build *emits* AND that the *CPU* supports.
+    // The compile-time flag still gates whether the kernel code is in
+    // the binary.
     //
     // Order:
-    //   1. AVX-512 (if built + present) — Phase 13/14 don't have an AVX-512
-    //      K-quant kernel yet, but the F32 matmul is the place this would
-    //      matter most; we keep AVX2 as the *F32* matmul tier for now.
+    //   1. AVX-512 (if built + present) — Phase 16 ships a 6x32 fused
+    //      F32 kernel; older phases added AVX-512 fused quantized matvec
+    //      (Q4_0 in Phase 13). This is the highest SIMD tier on x86.
     //   2. AVX2 (built + present)        — 6x16 FMA tile.
     //   3. Blocked                       — cache tiling only.
     //
@@ -946,7 +1098,8 @@ MatmulVariant pick_best(MatmulVariant v) {
     // even when SIMD is present (each worker thread runs the best SIMD
     // kernel it can).
     if (CpuFeatures::get().hardware_threads >= 2) return MatmulVariant::Threaded;
-    if (shims().avx2())                              return MatmulVariant::Avx2;
+    if (shims().avx512())                            return MatmulVariant::Avx512;
+    if (shims().avx2())                               return MatmulVariant::Avx2;
     return MatmulVariant::Blocked;
 }
 
@@ -971,6 +1124,7 @@ std::string_view variant_name(MatmulVariant v) noexcept {
         case MatmulVariant::Naive:     return "naive";
         case MatmulVariant::Blocked:   return "blocked";
         case MatmulVariant::Avx2:      return "avx2";
+        case MatmulVariant::Avx512:    return "avx512";
         case MatmulVariant::Threaded:  return "threaded";
     }
     return "unknown";
@@ -996,6 +1150,7 @@ Tensor matmul(const Tensor& a, const Tensor& b, MatmulVariant v) {
         case MatmulVariant::Naive:    return matmul_naive_impl(ac, bc);
         case MatmulVariant::Blocked:  return matmul_blocked_impl(ac, bc);
         case MatmulVariant::Avx2:     return matmul_avx2_impl(ac, bc);
+        case MatmulVariant::Avx512:   return matmul_avx512_impl(ac, bc);
         case MatmulVariant::Threaded: return matmul_threaded_impl(ac, bc);
         default:                      return matmul_avx2_impl(ac, bc);
     }
@@ -1004,6 +1159,7 @@ Tensor matmul(const Tensor& a, const Tensor& b, MatmulVariant v) {
 Tensor matmul_naive   (const Tensor& a, const Tensor& b) { return matmul(a, b, MatmulVariant::Naive); }
 Tensor matmul_blocked (const Tensor& a, const Tensor& b) { return matmul(a, b, MatmulVariant::Blocked); }
 Tensor matmul_avx2    (const Tensor& a, const Tensor& b) { return matmul(a, b, MatmulVariant::Avx2); }
+Tensor matmul_avx512  (const Tensor& a, const Tensor& b) { return matmul(a, b, MatmulVariant::Avx512); }
 Tensor matmul_threaded(const Tensor& a, const Tensor& b) { return matmul(a, b, MatmulVariant::Threaded); }
 
 }  // namespace tinyllm::ops

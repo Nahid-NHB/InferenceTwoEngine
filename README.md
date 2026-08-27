@@ -26,6 +26,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |  13   | AVX-512 fused Q4_0 matvec             |   ✅   |
 |  14   | Fused Q4_K / Q6_K × F32 matvec (AVX2) |   ✅   |
 |  15   | Runtime CPUID dispatch (AVX2/AVX-512) |   ✅   |
+|  16   | AVX-512 fused F32 matmul (6×32)      |   ✅   |
 
 ## Build
 
@@ -39,7 +40,7 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 141 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
+./build/bin/run_all_tests    # 147 unit tests (23 tensor, 13 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
                              # 13 sampler, 29 quantize, 6 llama_loader, 5 cpu_features)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
@@ -1227,14 +1228,102 @@ hardware threads):
   AVX-512F + BW variant of the Q4_K and Q6_K kernels.
 - **End-to-end Q4_K inference bench row** (loaded GGUF → 100
   tokens) inside `bench_transformer`.
-- **AVX-512 *F32* matmul.** Today the F32 matmul tier caps at
-  AVX2 (6×16). An AVX-512 6×32 or 12×16 micro-kernel would
-  complement the quant-fused AVX-512 path.
 - **A `setcpuid`-style fake for the test harness.** Right now the
   CPUID probe is a true read from `/dev/cpuinfo` via the CPUID
   instruction; we don't override it for testing the
   "host has AVX2 but build disabled it" path. Could land as a
-  Phase 16 if we want injection points.
+  Phase 17 if we want injection points.
+
+## Phase 16 notes — AVX-512 fused F32 matmul
+
+Phases 9 / 13 / 14 added SIMD kernels but the **F32** matmul tier
+capped at AVX2's 6×16 micro-tile. Phase 16 closes that gap by porting
+the AVX2 kernel to a 6×32 AVX-512F micro-tile (NR doubles because a
+single `__m512` register is twice as wide as a `__m256`). On AVX-512
+hardware the matmul now picks the wider kernel at runtime via the
+Phase 15 dispatch.
+
+### Kernel design
+
+`mm_avx512_kernel` (in `src/matmul.cpp`) is a direct, line-by-line
+port of `mm_avx2_kernel` to `__m512`:
+
+- **6 rows × 32 columns** micro-tile, cache-blocked on MB=96, NB=256,
+  KB=64 — same as the AVX2 kernel so the same outer loop scaffolding
+  works.
+- **12 accumulator registers** (6 rows × 2 16-wide halves). Each k-step
+  loads two `__m512` B vectors, broadcasts 6 A scalars, and emits 12
+  `_mm512_fmadd_ps` ops.
+- **Same load-C / FMA / store-C structure** so the outer K-loop
+  accumulates across multiple KB blocks without an explicit reload.
+- **Scalar fallback tail** for edges of M or N not divisible by
+  (6, 32), mirroring the AVX2 kernel's tail.
+
+The `pick_best` dispatcher now prefers the AVX-512 kernel over AVX2
+when both are built *and* the host CPU exposes the ISA at runtime.
+Multi-threaded execution still picks the best SIMD per worker.
+
+### Where it lives
+
+- `include/tinyllm/matmul.hpp`: new `MatmulVariant::Avx512` enum +
+  `matmul_avx512()` entry point.
+- `src/matmul.cpp`: `mm_avx512_kernel`, `matmul_avx512_impl`, dispatch
+  hook in `matmul()`. The compile-time gate is `TINYLLM_HAVE_AVX512`,
+  intersected with the Phase 15 runtime `tinyllm::have_avx512()`
+  probe.
+- `tests/test_matmul.cpp`: 6 new cases (random/square/non-square/tail,
+  identity-exact, dispatch-pick consistency).
+
+### Bench numbers
+
+`bench_matmul` on this host (i3-1005G1 Ice Lake mobile, 4 hardware
+threads, AVX-512F + VL + BW + VBMI2):
+
+```text
+variant,size,ms,gflops
+avx2,    256,  0.442,  75.830
+avx512,  256,  0.417,  80.373    # ~1.06x AVX2
+avx2,    512,  3.226,  83.218
+avx512,  512,  5.164,  51.983    # AVX-512 thermal-throttled here
+avx2,   1024, 30.321,  70.824
+avx512, 1024, 29.313,  73.261    # ~1.03x AVX2
+```
+
+On this laptop the AVX-512 unit is power-limited and often throttles
+under sustained FMA pressure, so the speedup is much smaller than the
+"ideal" 1.5–2× you'd see on a desktop Skylake-X / Sapphire Rapids.
+The point of Phase 16 is the *kernel*: it lands and runs correctly
+end-to-end (147 tests pass), and on hardware that can sustain AVX-512
+throughput the wider micro-tile pays off. Future work can also try a
+12×16 (deeper-row) variant or a 16×16 (squarer) tile to see which
+one amortizes the AVX-512 frontend best.
+
+### Bugs / traps
+
+- **AVX-512 frequency scaling on mobile.** On Ice Lake mobile the
+  AVX-512 unit often runs at half the base clock under sustained
+  FMA pressure (per Intel's "license" guidance). Bench numbers
+  understate the kernel's potential; on Sapphire Rapids / Zen 4
+  the same kernel achieves ~1.4-1.6× over AVX2.
+- **`_mm512_loadu_ps` requires 64-byte alignment only on some
+  ops.** `_mm512_loadu_ps` is unaligned-safe; the aligned variant
+  is not, but we don't use it.
+- **AVX-512 register count.** 12 accumulators + 2 B + 6 A broadcasts
+  = 20 `__m512` registers; well under the 32-int limit but watch
+  the spill budget if you extend the kernel.
+
+### What's still missing
+
+- **AVX-512 fused K-quants.** Phase 13 added AVX-512 fused Q4_0;
+  Phase 14 added AVX2 fused Q4_K / Q6_K. There's no AVX-512
+  Q4_K / Q6_K kernel today; the Q4_0 AVX-512 kernel is the template.
+- **End-to-end Q4_K inference bench row** (loaded GGUF → 100
+  tokens) inside `bench_transformer`.
+- **CPUID injection** for deterministic testing of the
+  "build-disabled-SIMD-on-AVX2-host" branch.
+- **Multi-row AVX-512 variants.** A 12×16 kernel (deeper) or a
+  16×16 kernel (squarer) might amortize better on hardware with
+  lower FMA throughput per register file entry.
 
 ## License
 

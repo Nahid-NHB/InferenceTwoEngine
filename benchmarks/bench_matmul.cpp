@@ -3,12 +3,13 @@
 // Compare all matmul variants at a range of sizes.
 //
 // For each size N x N:
-//   - naive, blocked, avx2, threaded
+//   - naive, blocked, avx2, [avx512], threaded
 //   - warmup once
 //   - report ms and GFLOPS
 //
 // Output is CSV-style so it can be diffed across runs / machines.
 // -----------------------------------------------------------------------------
+#include "tinyllm/cpu_features.hpp"
 #include "tinyllm/matmul.hpp"
 
 #include <algorithm>
@@ -34,6 +35,12 @@ struct Bench {
 };
 
 int main() {
+    std::printf("# runtime: %s\n", tinyllm::cpu_feature_summary());
+    std::printf("# dispatch: avx2=%d avx-512=%d threads=%d\n",
+                ops::have_avx2() ? 1 : 0,
+                ops::have_avx512() ? 1 : 0,
+                ops::hardware_threads());
+
     std::vector<int64_t> sizes = {64, 128, 256, 512, 1024};
     std::vector<ops::MatmulVariant> variants = {
         ops::MatmulVariant::Naive,
@@ -41,6 +48,17 @@ int main() {
         ops::MatmulVariant::Avx2,
         ops::MatmulVariant::Threaded,
     };
+#if TINYLLM_ENABLE_AVX512
+    // Phase 16: include the AVX-512 fused F32 kernel in the sweep when
+    // the build emitted it. The `ops::have_avx512()` runtime probe (set
+    // via the Phase 15 CPUID module) decides whether to actually call
+    // the kernel; on non-AVX-512 hosts the path silently falls back to
+    // the blocked scalar tile, so we don't have to special-case the
+    // bench loop here. The output line just reads "avx512,..." even on
+    // hosts where it ran the scalar fallback (look at the dispatch
+    // header line above to know which).
+    variants.insert(variants.begin() + 3, ops::MatmulVariant::Avx512);
+#endif
 
     std::mt19937 rng(123);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);

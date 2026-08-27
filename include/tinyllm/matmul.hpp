@@ -29,6 +29,7 @@ enum class MatmulVariant {
     Blocked     = 2,   // cache blocked (no SIMD)
     Avx2        = 3,   // AVX2 FMA + cache blocking (runtime-detected)
     Threaded    = 4,   // multi-threaded (uses best available kernel)
+    Avx512      = 5,   // AVX-512F FMA + cache blocking (Phase 16; runtime-detected)
 };
 
 // 2-D x 2-D matrix multiply. Throws on shape mismatch or non-2-D inputs.
@@ -38,6 +39,7 @@ Tensor matmul(const Tensor& a, const Tensor& b, MatmulVariant v = MatmulVariant:
 Tensor matmul_naive   (const Tensor& a, const Tensor& b);
 Tensor matmul_blocked (const Tensor& a, const Tensor& b);
 Tensor matmul_avx2    (const Tensor& a, const Tensor& b);
+Tensor matmul_avx512  (const Tensor& a, const Tensor& b);
 Tensor matmul_threaded(const Tensor& a, const Tensor& b);
 
 // What did dispatch end up picking? (For logging / debugging.)

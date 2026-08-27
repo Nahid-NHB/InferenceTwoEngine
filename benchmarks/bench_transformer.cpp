@@ -227,6 +227,11 @@ static void bench_matmul(std::vector<BenchResult>& out,
         out.push_back(bench("matmul_avx2",     shape, iters, [&] {
             return ops::matmul(A, B, ops::MatmulVariant::Avx2);
         }));
+#if TINYLLM_ENABLE_AVX512
+        out.push_back(bench("matmul_avx512",   shape, iters, [&] {
+            return ops::matmul(A, B, ops::MatmulVariant::Avx512);
+        }));
+#endif
         out.push_back(bench("matmul_blocked",  shape, iters, [&] {
             return ops::matmul(A, B, ops::MatmulVariant::Blocked);
         }));
