@@ -25,6 +25,7 @@ ourselves — no PyTorch, no TensorFlow, no ONNX, no llama.cpp.
 |  12   | K-quant dequant (Q4_K / Q5_K / Q6_K) |   ✅   |
 |  13   | AVX-512 fused Q4_0 matvec             |   ✅   |
 |  14   | Fused Q4_K / Q6_K × F32 matvec (AVX2) |   ✅   |
+|  15   | Runtime CPUID dispatch (AVX2/AVX-512) |   ✅   |
 
 ## Build
 
@@ -38,9 +39,9 @@ Requirements: CMake ≥ 3.20, a C++20 compiler (GCC 11+, Clang 14+), Ninja.
 ## Test & benchmark
 
 ```bash
-./build/bin/run_all_tests    # 136 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
+./build/bin/run_all_tests    # 141 unit tests (23 tensor, 7 matmul, 13 tokenizer, 14 gguf,
                              # 7 rmsnorm, 8 rope, 5 attention, 3 mlp, 5 model, 7 kv_cache,
-                             # 13 sampler, 29 quantize, 6 llama_loader)
+                             # 13 sampler, 29 quantize, 6 llama_loader, 5 cpu_features)
 ./build/bin/bench_tensor     # naive matmul baseline numbers
 ./build/bin/bench_matmul     # naive / blocked / AVX2 / threaded comparison
 ./build/bin/bench_quantize   # Q4_0 / Q8_0 / Q4_K / Q6_K × F32 matvec vs F32 matmul
@@ -1117,11 +1118,123 @@ stride-2 gather which only hits ~4 of 8.
   would give another ~1.5× on Skylake-X / Zen 4 / Sapphire Rapids.
   Most laptop/desktop CPUs don't have AVX-512 so AVX2 is the
   more-portable target.
-- **Runtime CPUID dispatch** for the AVX2 path. Today
-  `TINYLLM_ENABLE_AVX2` is a compile-time choice.
-- **A bench row for end-to-end Q4_K inference** (loaded GGUf → 100
+- **A bench row for end-to-end Q4_K inference** (loaded GGUF → 100
   tokens). The existing `gguf_driver` runs the full path, just not in
   the bench harness.
+
+## Phase 15 notes — Runtime CPUID dispatch
+
+Phases 13 / 14 shipped AVX-512 + AVX2 fused quantized kernels but
+selected them with **compile-time** macros (`TINYLLM_ENABLE_AVX2`,
+`TINYLLM_ENABLE_AVX512`). A binary built without those flags could
+never take the AVX2 path even on hardware that exposes it.
+
+Phase 15 replaces that with a real CPUID probe (the new
+`tinyllm::cpu_info()` / `tinyllm::have_avx2()` / etc.). The probe
+runs once, lazily, via a function-local static — thread-safe and
+zero-cost after first call. The public dispatch in `matmul(...)`,
+`matmul_q4_0_f32(...)`, `matmul_q4_K_f32(...)`, and
+`matmul_q6_K_f32(...)` now picks at runtime based on what the host
+CPU actually exposes, intersecting with whatever SIMD the build
+emitted. The compile-time flags stay as **upper-bound gates** for
+those who want to omit AVX code entirely (e.g. for tiny-musl or
+SDE/JIT use cases where binary size matters).
+
+### What's new
+
+- `include/tinyllm/cpu_features.hpp` declares the `CpuInfo` struct
+  and the `have_*` / `hardware_threads` / `cpu_feature_summary`
+  free functions.
+- `src/cpu_features.cpp` walks CPUID leaves 1 and 7 (sub-leaf 0).
+  MSVC path uses `__cpuidex`; GCC / Clang on x86 use
+  `__get_cpuid_count` from `<cpuid.h>`. Non-x86 returns all-false.
+- `src/matmul.cpp` keeps its legacy `CpuFeatures` shim for
+  backward-compatible call sites but routes the real reads through
+  the new module. `pick_best()` now branches on the runtime probe.
+- `src/quantize.cpp` lifts the dequant-bounce fallback out of the
+  `#if !AVX2` guard so the dispatch always has a reference path to
+  fall back on. The fused-kernel calls are wrapped in `#if
+  TINYLLM_ENABLE_AVX{2,512}` then a runtime `if (have_*)` check
+  inside.
+- CMake gains `TINYLLM_ENABLE_AVX2=ON` and `TINYLLM_ENABLE_AVX512=ON`
+  options (default ON when the compiler supports the ISA). Passing
+  `-DTINYLLM_ENABLE_AVX2=OFF -DTINYLLM_ENABLE_AVX512=OFF` produces a
+  scalar-only binary that still runs end-to-end. AVX-512 implies
+  AVX2 on the toolchains we target, so the latter is hard-required
+  when the former is on (CMake errors out otherwise).
+- Tests: `tests/test_cpu_features.cpp` adds 5 cases (consistency,
+  AVX-512 = F+VL+BW, threads ≥ 1, summary is a C-string, numeric
+  parity between auto-dispatched and explicit-AVX2 matmul).
+
+### How dispatch reads
+
+```text
+matmul(A, B, Auto):
+  if hardware_threads >= 2              → Threaded   (each worker uses AVX2 if available)
+  elif TINYLLM_HAVE_AVX2 && have_avx2() → Avx2
+  else                                  → Blocked
+
+matmul_q4_0_f32(qmat, M, K, x, y):
+  if TINYLLM_HAVE_AVX512 && have_avx512() → matvec_q4_0_f32_avx512
+  elif TINYLLM_HAVE_AVX2 && have_avx2()   → matvec_q4_0_f32_avx2
+  else                                    → matmul_q4_0_f32_reference   (dequant-bounce)
+
+matmul_q4_K_f32(...):
+  if TINYLLM_HAVE_AVX2 && have_avx2() → matvec_q4_K_f32_avx2
+  else                                → matmul_q4_K_f32_reference
+
+matmul_q6_K_f32(...):
+  if TINYLLM_HAVE_AVX2 && have_avx2() → matvec_q6_K_f32_avx2
+  else                                → matmul_q6_K_f32_reference
+```
+
+### Reading from the bench output
+
+`bench_quantize` and `bench_transformer` now print two header lines.
+The first (`CPU feature summary`) is the raw probe result — what
+the host CPU actually exposes at runtime. The second (`Dispatch` /
+`# dispatch`) is the value the engine would actually use, after the
+compile-time gates are intersected. On this build host (Ice Lake
+mobile: AVX-512F + VL + BW + VBMI2 + AVX2 + FMA + BMI2, 4
+hardware threads):
+
+```text
+# runtime: avx2 avx512f avx512bw avx512vl avx512vbmi2 fma bmi2 sse4_2 avx(4 threads)
+# dispatch: avx2=1 avx-512=1 threads=4
+```
+
+### Bugs / traps
+
+- **GCC defines `__AVX2__` automatically when any AVX-512 flag is
+  set.** Disabling AVX2 while keeping AVX-512 would try to compile
+  AVX2 intrinsics without the matching codegen flags. We guard
+  against that in CMake: `TINYLLM_ENABLE_AVX512=ON` is a hard error
+  when `TINYLLM_ENABLE_AVX2=OFF`.
+- **`__get_cpuid_count` lives in `<cpuid.h>`, not transitively
+  included by `<thread>`.** Earlier draft of `cpu_features.cpp`
+  relied on transitive inclusion; the explicit include is required.
+- **Function-local statics are thread-safe at init.** The probe
+  cache uses one (`static const CpuInfo info = probe();`); multiple
+  threads calling `cpu_info()` concurrently see the same
+  consistent snapshot, and the work happens at most once.
+
+### What's still missing
+
+- **AVX-512 fused K-quants.** Phase 13 added the AVX-512 fused
+  Q4_0 kernel; Phase 14 added the AVX2 fused Q4_K / Q6_K kernels
+  but not their AVX-512 counterparts. With Phase 15's dispatch in
+  place the next step is straightforward — just write an
+  AVX-512F + BW variant of the Q4_K and Q6_K kernels.
+- **End-to-end Q4_K inference bench row** (loaded GGUF → 100
+  tokens) inside `bench_transformer`.
+- **AVX-512 *F32* matmul.** Today the F32 matmul tier caps at
+  AVX2 (6×16). An AVX-512 6×32 or 12×16 micro-kernel would
+  complement the quant-fused AVX-512 path.
+- **A `setcpuid`-style fake for the test harness.** Right now the
+  CPUID probe is a true read from `/dev/cpuinfo` via the CPUID
+  instruction; we don't override it for testing the
+  "host has AVX2 but build disabled it" path. Could land as a
+  Phase 16 if we want injection points.
 
 ## License
 

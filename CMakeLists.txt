@@ -48,6 +48,7 @@ endfunction()
 add_library(tinyllm_core
     src/tensor.cpp
     src/memory.cpp
+    src/cpu_features.cpp
     src/matmul.cpp
     src/tokenizer.cpp
     src/gguf.cpp
@@ -67,27 +68,47 @@ target_include_directories(tinyllm_core PUBLIC
 )
 tinyllm_set_options(tinyllm_core)
 
+# Phase 15: SIMD is auto-detected at runtime. The compile-time flag
+# is now just an upper-bound gate — pass -DTINYLLM_ENABLE_AVX2=OFF (or
+# -DTINYLLM_ENABLE_AVX512=OFF) to *omit* the corresponding kernel code
+# from the binary entirely (useful for size-limited or narrowly-portable
+# builds). Without those overrides we default to ON whenever the
+# compiler supports the ISA — the runtime CPUID probe then decides
+# whether to actually use the kernel.
+#
+# Note: AVX-512 implies AVX2 on GCC/Clang (the `-mavx512f` flag turns
+# on `__AVX2__` automatically), so disabling AVX2 also disables AVX-512
+# even if the latter option is on. The runtime dispatch in src/matmul.cpp
+# + src/quantize.cpp handles the rest.
+option(TINYLLM_ENABLE_AVX2   "Compile AVX2 kernels into tinyllm_core" ON)
+option(TINYLLM_ENABLE_AVX512 "Compile AVX-512 kernels into tinyllm_core" ON)
+if(TINYLLM_ENABLE_AVX512 AND NOT TINYLLM_ENABLE_AVX2)
+    message(FATAL_ERROR
+        "TINYLLM_ENABLE_AVX512=ON requires TINYLLM_ENABLE_AVX2=ON "
+        "(AVX-512 implies AVX2 on the toolchains we target).")
+endif()
+
 # Enable AVX2 + FMA on x86 if the compiler supports it.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i.86)")
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-mavx2 -mfma -mbmi2" HAVE_AVX2_FLAG)
-    if(HAVE_AVX2_FLAG)
-        message(STATUS "Enabling AVX2 + FMA in tinyllm_core")
+    if(TINYLLM_ENABLE_AVX2 AND HAVE_AVX2_FLAG)
+        message(STATUS "Enabling AVX2 + FMA in tinyllm_core (runtime-dispatched)")
         target_compile_options(tinyllm_core PUBLIC -mavx2 -mfma -mbmi2)
         target_compile_definitions(tinyllm_core PUBLIC TINYLLM_ENABLE_AVX2=1)
     endif()
 
     # Phase 13: prefer AVX-512F+VL+BW+VBMI2 for the Q4_0 matvec kernel
-    # when available. The dispatch in src/matmul.cpp falls back to AVX2
-    # if the runtime CPU doesn't expose AVX-512F. We require VL+BW so
-    # we can use 512-bit byte/word shifts and the VBMI2 byte-shuffle
-    # instructions (vpcompressd is in VBMI2; we use it as a fast
-    # deinterleave). VNNI is not required.
+    # when available. Runtime CPUID probe picks between AVX-512 / AVX2 /
+    # dequant-bounce based on what the host CPU actually exposes. We
+    # require VL+BW so we can use 512-bit byte/word shifts and the VBMI2
+    # byte-shuffle instructions (vpcompressd is in VBMI2; we use it as a
+    # fast deinterleave). VNNI is not required.
     check_cxx_compiler_flag(
         "-mavx512f -mavx512vl -mavx512bw -mavx512vbmi2" HAVE_AVX512_FLAG)
-    if(HAVE_AVX512_FLAG)
+    if(TINYLLM_ENABLE_AVX512 AND HAVE_AVX512_FLAG)
         message(STATUS
-            "Enabling AVX-512F+VL+BW+VBMI2 in tinyllm_core (Q4_0 kernel)")
+            "Enabling AVX-512F+VL+BW+VBMI2 in tinyllm_core (runtime-dispatched)")
         target_compile_options(tinyllm_core PUBLIC
             -mavx512f -mavx512vl -mavx512bw -mavx512vbmi2)
         target_compile_definitions(tinyllm_core PUBLIC
@@ -138,4 +159,7 @@ message(STATUS "  C++ standard:      ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler:          ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Build tests:       ${TINYLLM_BUILD_TESTS}")
 message(STATUS "  Build benchmarks:  ${TINYLLM_BUILD_BENCHMARKS}")
+message(STATUS "  AVX2 enabled:      ${TINYLLM_ENABLE_AVX2}")
+message(STATUS "  AVX-512 enabled:   ${TINYLLM_ENABLE_AVX512}")
+message(STATUS "  Dispatch:          runtime CPUID (Phase 15)")
 message(STATUS "")

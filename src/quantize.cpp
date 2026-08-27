@@ -16,6 +16,7 @@
 // -----------------------------------------------------------------------------
 #include "tinyllm/quantize.hpp"
 
+#include "tinyllm/cpu_features.hpp"
 #include "tinyllm/matmul.hpp"
 #include "tinyllm/tensor.hpp"
 
@@ -300,7 +301,9 @@ void matmul_q8_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
     }
 }
 
-#if !TINYLLM_ENABLE_AVX512 && !TINYLLM_ENABLE_AVX2
+// Phase 15: always available as the runtime fallback (no longer guarded
+// by the SIMD compile-time flags — the dispatch in matmul_q4_0_f32 now
+// chooses between this and the AVX kernels at runtime).
 void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
                                 const float* x, float* y) {
     if (K % kQ4_0BlockSize != 0) {
@@ -319,7 +322,6 @@ void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
         y[m] = static_cast<float>(acc);
     }
 }
-#endif  // !TINYLLM_ENABLE_AVX512 && !TINYLLM_ENABLE_AVX2
 
 // (Forward declaration for the AVX2 fused Q4_0 path lives at the top of
 // this file, outside this anonymous namespace.)
@@ -328,16 +330,27 @@ void matmul_q4_0_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
 
 void matmul_q4_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
+    // Phase 15: runtime dispatch.
+    //   - If the build emitted AVX-512 (TINYLLM_ENABLE_AVX512=1) AND the
+    //     CPU exposes AVX-512F+VL+BW at runtime, use the AVX-512 kernel.
+    //   - Else, if the build emitted AVX2 AND the CPU has AVX2+FMA at
+    //     runtime, use the AVX2 kernel.
+    //   - Else, dequantize-on-the-fly reference.
+    // The compile-time flag is still an upper-bound gate — a build with
+    // TINYLLM_ENABLE_AVX2=OFF cannot accidentally call the AVX2 kernel.
 #if TINYLLM_ENABLE_AVX512
-    // Phase 13: prefer AVX-512 when the build exposes it. The dispatch is
-    // static (compile-time flag) today; a runtime CPUID probe could split
-    // it later. AVX-512F+VL+BW is the floor.
-    tinyllm::ops::matvec_q4_0_f32_avx512(qmat, M, K, x, y);
-#elif TINYLLM_ENABLE_AVX2
-    tinyllm::ops::matvec_q4_0_f32_avx2(qmat, M, K, x, y);
-#else
-    matmul_q4_0_f32_reference(qmat, M, K, x, y);
+    if (tinyllm::have_avx512()) {
+        tinyllm::ops::matvec_q4_0_f32_avx512(qmat, M, K, x, y);
+        return;
+    }
 #endif
+#if TINYLLM_ENABLE_AVX2
+    if (tinyllm::have_avx2() && tinyllm::have_fma()) {
+        tinyllm::ops::matvec_q4_0_f32_avx2(qmat, M, K, x, y);
+        return;
+    }
+#endif
+    matmul_q4_0_f32_reference(qmat, M, K, x, y);
 }
 
 void matmul_q8_0_f32(const uint8_t* qmat, int64_t M, int64_t K,
@@ -567,20 +580,25 @@ void matmul_q6_K_f32_reference(const uint8_t* qmat, int64_t M, int64_t K,
 
 void matmul_q4_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
+    // Phase 15: runtime dispatch (same model as Q4_0 above).
 #if TINYLLM_ENABLE_AVX2
-    tinyllm::ops::matvec_q4_K_f32_avx2(qmat, M, K, x, y);
-#else
-    matmul_q4_K_f32_reference(qmat, M, K, x, y);
+    if (tinyllm::have_avx2() && tinyllm::have_fma()) {
+        tinyllm::ops::matvec_q4_K_f32_avx2(qmat, M, K, x, y);
+        return;
+    }
 #endif
+    matmul_q4_K_f32_reference(qmat, M, K, x, y);
 }
 
 void matmul_q6_K_f32(const uint8_t* qmat, int64_t M, int64_t K,
                      const float* x, float* y) {
 #if TINYLLM_ENABLE_AVX2
-    tinyllm::ops::matvec_q6_K_f32_avx2(qmat, M, K, x, y);
-#else
-    matmul_q6_K_f32_reference(qmat, M, K, x, y);
+    if (tinyllm::have_avx2() && tinyllm::have_fma()) {
+        tinyllm::ops::matvec_q6_K_f32_avx2(qmat, M, K, x, y);
+        return;
+    }
 #endif
+    matmul_q6_K_f32_reference(qmat, M, K, x, y);
 }
 
 }  // namespace tinyllm

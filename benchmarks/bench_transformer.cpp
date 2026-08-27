@@ -35,6 +35,7 @@
 // Use the `--quick` flag to limit iterations.
 // -----------------------------------------------------------------------------
 #include "tinyllm/attention.hpp"
+#include "tinyllm/cpu_features.hpp"
 #include "tinyllm/llama_block.hpp"
 #include "tinyllm/matmul.hpp"
 #include "tinyllm/mlp.hpp"
@@ -514,7 +515,8 @@ int main(int argc, char** argv) {
     ModelCfg big    {"big",    2048, 5504, 16, 128, 16, 2, 4096};
 
     std::printf("Phase 10 unified benchmark suite (iters=%d)\n", iters);
-    std::printf("Auto-detected CPU: AVX2=%s, AVX-512=%s, threads=%d\n",
+    std::printf("CPU feature summary: %s\n", tinyllm::cpu_feature_summary());
+    std::printf("Dispatch (kernel + flags): AVX2=%s, AVX-512=%s, threads=%d\n",
                 ops::have_avx2() ? "yes" : "no",
                 ops::have_avx512() ? "yes" : "no",
                 ops::hardware_threads());

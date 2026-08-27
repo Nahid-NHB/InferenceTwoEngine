@@ -21,6 +21,7 @@
 
 #include "tinyllm/matmul.hpp"
 
+#include "tinyllm/cpu_features.hpp"
 #include "tinyllm/quantize.hpp"
 #include "tinyllm/tensor.hpp"
 
@@ -55,34 +56,49 @@ namespace tinyllm::ops {
 namespace {
 
 // -----------------------------------------------------------------------------
-// Runtime CPU feature detection. We do this once at first call.
+// Runtime CPU feature detection.
+//
+// Phase 15 wired the real CPUID-based probe in `cpu_features.cpp`. The
+// legacy `CpuFeatures` struct above is gone; everything in this file now
+// calls the free functions in `tinyllm::` directly. We keep one helper
+// here so the existing call sites don't have to change — they keep
+// reading `CpuFeatures::get().hardware_threads` instead of switching to
+// the global name. The shim layers ON TOP of the real CPUID probe; the
+// compile-time flags `TINYLLM_HAVE_AVX2` / `TINYLLM_HAVE_AVX512` remain
+// as upper-bound gates — if the build omitted the kernel, the runtime
+// can never select it.
 // -----------------------------------------------------------------------------
+namespace {
+
+struct Shims {
+    bool avx2()  const noexcept { return TINYLLM_HAVE_AVX2 && tinyllm::have_avx2(); }
+    bool avx512() const noexcept { return TINYLLM_HAVE_AVX512 && tinyllm::have_avx512(); }
+    int  hardware_threads() const noexcept { return tinyllm::hardware_threads(); }
+};
+
+const Shims& shims() noexcept {
+    static const Shims s;
+    return s;
+}
+
+}  // namespace
+
+// Backward-compat alias. Kept as an inline shim so the call sites
+// below don't need to change. New callers should prefer
+// `tinyllm::have_avx2()` / `tinyllm::hardware_threads()` directly.
 struct CpuFeatures {
     bool avx2 = false;
     bool avx512 = false;
     int  hardware_threads = 1;
 
     static const CpuFeatures& get() {
-        static const CpuFeatures f = detect();
-        return f;
-    }
-
-private:
-    static CpuFeatures detect() {
-        CpuFeatures f;
-        f.hardware_threads = std::max<unsigned>(1, std::thread::hardware_concurrency());
-#if TINYLLM_HAVE_AVX2
-        // __AVX2__ is a compile-time macro. To runtime-detect, we'd inspect
-        // CPUID. For simplicity (and because we only build with -mavx2 when
-        // we want it), we just say "AVX2 is present iff compiled with it."
-        f.avx2 = true;
-#endif
-#if TINYLLM_HAVE_AVX512
-        // Same story: the runtime checks would be a CPUID walk; for now
-        // we trust the compile-time flag. Real deployments on Skylake-X
-        // and later can flip this with a runtime probe later.
-        f.avx512 = true;
-#endif
+        static const CpuFeatures f = []() {
+            CpuFeatures r;
+            r.avx2  = shims().avx2();
+            r.avx512 = shims().avx512();
+            r.hardware_threads = shims().hardware_threads();
+            return r;
+        }();
         return f;
     }
 };
@@ -915,12 +931,23 @@ namespace {
 // -----------------------------------------------------------------------------
 MatmulVariant pick_best(MatmulVariant v) {
     if (v != MatmulVariant::Auto) return v;
+    // Runtime dispatch (Phase 15): prefer the highest-performing kernel
+    // the build *emits* AND that the *CPU* supports. The compile-time
+    // flag still gates whether the kernel code is in the binary.
+    //
+    // Order:
+    //   1. AVX-512 (if built + present) — Phase 13/14 don't have an AVX-512
+    //      K-quant kernel yet, but the F32 matmul is the place this would
+    //      matter most; we keep AVX2 as the *F32* matmul tier for now.
+    //   2. AVX2 (built + present)        — 6x16 FMA tile.
+    //   3. Blocked                       — cache tiling only.
+    //
+    // Multi-threading: if we have 2+ cores, we prefer the threaded path
+    // even when SIMD is present (each worker thread runs the best SIMD
+    // kernel it can).
     if (CpuFeatures::get().hardware_threads >= 2) return MatmulVariant::Threaded;
-#if TINYLLM_HAVE_AVX2
-    return MatmulVariant::Avx2;
-#else
+    if (shims().avx2())                              return MatmulVariant::Avx2;
     return MatmulVariant::Blocked;
-#endif
 }
 
 }  // namespace
@@ -931,9 +958,13 @@ MatmulVariant pick_best(MatmulVariant v) {
 MatmulVariant last_picked_variant() noexcept {
     return static_cast<MatmulVariant>(g_last_variant.load(std::memory_order_relaxed));
 }
-int  hardware_threads() noexcept { return CpuFeatures::get().hardware_threads; }
-bool have_avx2() noexcept { return CpuFeatures::get().avx2; }
-bool have_avx512() noexcept { return CpuFeatures::get().avx512; }
+// Phase 15: the legacy `ops::have_avx2()` / `ops::have_avx512()` keep
+// working so existing callers (benchmarks) don't change. They intersect
+// the runtime probe with the compile-time "did we emit the kernel?"
+// gate.
+int  hardware_threads() noexcept { return tinyllm::hardware_threads(); }
+bool have_avx2()    noexcept { return shims().avx2();  }
+bool have_avx512()  noexcept { return shims().avx512(); }
 std::string_view variant_name(MatmulVariant v) noexcept {
     switch (v) {
         case MatmulVariant::Auto:     return "auto";

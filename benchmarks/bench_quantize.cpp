@@ -17,6 +17,7 @@
 // falls back to the reference; that's the next thing to optimize if
 // Q8_0 matters.
 // -----------------------------------------------------------------------------
+#include "tinyllm/cpu_features.hpp"
 #include "tinyllm/matmul.hpp"
 #include "tinyllm/quantize.hpp"
 #include "tinyllm/tensor.hpp"
@@ -32,7 +33,13 @@ using namespace tinyllm;
 using clk = std::chrono::high_resolution_clock;
 
 int main() {
-    std::printf("# build: AVX2=%d AVX-512=%d threads=%d\n",
+    // Phase 15: print the runtime CPU feature summary so the bench
+    // output makes it obvious which kernels were selected. The compile-
+    // time flags `TINYLLM_ENABLE_AVX2` / `TINYLLM_ENABLE_AVX512` are
+    // upper-bound gates; the `have_*` numbers below reflect what was
+    // available *and* what the build emitted.
+    std::printf("# runtime: %s\n", tinyllm::cpu_feature_summary());
+    std::printf("# dispatch: avx2=%d avx-512=%d threads=%d\n",
                 ops::have_avx2() ? 1 : 0,
                 ops::have_avx512() ? 1 : 0,
                 ops::hardware_threads());
